@@ -1,0 +1,44 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Editors and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Medical images, preprocessed arrays, predictions, and checkpoints
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+
+# Runtime artifacts if Code is ever used as the repository root. Keep these
+# patterns anchored so source paths such as configs/models remain trackable.
+/Workspace/
+/Outputs/
+/Checkpoints/
+/Models/
+/reports/
+/logs/
+
+# Local environment material
+.env
+environment.json

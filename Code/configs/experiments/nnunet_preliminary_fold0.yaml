@@ -1,0 +1,13 @@
+experiment_kind: preliminary_single_fold_baseline
+model_config: ../models/nnunetv2_3d_fullres.yaml
+dataset_config: ../datasets/brats2023_gli.yaml
+fold: 0
+configuration: 3d_fullres
+trainer_candidates:
+  - nnUNetTrainer_50epochs
+  - nnUNetTrainer_20epochs
+selection_rule: Select 50 epochs only when the measured estimate is at most about 3 hours.
+allow_resume: true
+ensemble: false
+external_data: false
+

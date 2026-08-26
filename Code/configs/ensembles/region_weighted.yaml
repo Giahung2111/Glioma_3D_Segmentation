@@ -1,0 +1,7 @@
+enabled: false
+status: future_placeholder
+method: region_weighted_probability
+region_order: [WT, TC, ET]
+enforce_nested_regions: true
+notes: Weights must be chosen from validation evidence in a future experiment.
+

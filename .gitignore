@@ -1,0 +1,86 @@
+# -----------------------------------------------------------------------------
+# Local medical data and generated experiment state
+# -----------------------------------------------------------------------------
+/Datasets/
+/Workspace/
+/Checkpoints/
+/Models/
+/Outputs/
+
+# External repositories are intentionally NOT ignored here. Keep them as
+# explicit Git submodules so their upstream commit provenance remains intact.
+
+# -----------------------------------------------------------------------------
+# Python environments, caches, coverage, and package build outputs
+# -----------------------------------------------------------------------------
+**/.venv/
+**/venv/
+**/env/
+**/__pycache__/
+*.py[cod]
+*$py.class
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.hypothesis/
+**/.tox/
+**/.nox/
+.coverage
+.coverage.*
+htmlcov/
+**/*.egg-info/
+**/build/
+**/dist/
+
+# -----------------------------------------------------------------------------
+# Medical images, preprocessed arrays, predictions, and model artifacts
+# -----------------------------------------------------------------------------
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.dcm
+*.npy
+*.npz
+*.b2nd
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# -----------------------------------------------------------------------------
+# Logs, temporary files, and packaged artifacts
+# -----------------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.pid
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# -----------------------------------------------------------------------------
+# Secrets and machine-local configuration
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+environment.json
+
+# -----------------------------------------------------------------------------
+# Notebook, editor, and operating-system files
+# -----------------------------------------------------------------------------
+**/.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+

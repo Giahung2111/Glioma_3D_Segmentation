@@ -1,0 +1,20 @@
+schema_version: 1
+
+paths:
+  project_root: ../..
+  datasets_root: ../../Datasets
+  workspace_root: ../../Workspace
+  external_nnunet_root: ../../External/nnUNet
+
+logging:
+  level: INFO
+  timestamp_format: "%Y-%m-%d %H:%M:%S"
+
+validation:
+  workers: 2
+  progress_every_cases: 10
+  affine_atol: 1.0e-5
+  affine_rtol: 1.0e-5
+  spacing_atol: 1.0e-6
+  require_3d: true
+  scan_voxel_values: true

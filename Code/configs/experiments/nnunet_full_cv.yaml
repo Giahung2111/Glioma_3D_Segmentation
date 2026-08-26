@@ -1,0 +1,9 @@
+experiment_kind: standard_reference_baseline
+enabled: false
+dataset_id: 501
+configuration: 3d_fullres
+folds: [0, 1, 2, 3, 4]
+trainer: nnUNetTrainer
+save_probabilities: true
+notes: Run only after explicit approval; this is not the preliminary experiment.
+

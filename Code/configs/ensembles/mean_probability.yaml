@@ -1,0 +1,6 @@
+enabled: false
+status: future_placeholder
+method: probability_mean
+enforce_nested_regions: true
+notes: Not used by the first nnU-Net baseline.
+

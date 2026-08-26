@@ -1,0 +1,9 @@
+backend: nnunetv2
+dataset_id: 501
+configuration: 3d_fullres
+fold: 0
+trainer: nnUNetTrainer
+save_probabilities: true
+pretrained_weights: null
+ensemble: false
+
