@@ -1,0 +1,6 @@
+[submodule "External/nnUNet"]
+	path = External/nnUNet
+	url = https://github.com/MIC-DKFZ/nnUNet.git
+[submodule "External/BraTS-2023-Metrics"]
+	path = External/BraTS-2023-Metrics
+	url = https://github.com/rachitsaluja/BraTS-2023-Metrics.git
