@@ -122,6 +122,9 @@ def test_linux_scripts_are_fail_closed_and_do_not_use_sudo() -> None:
 
     assert "\nsudo " not in setup
     assert "\nsudo " not in pipeline
+    assert 'EVALUATOR_PYTHON_VERSION="3.9.23"' in setup
+    assert setup.count('"python=$EVALUATOR_PYTHON_VERSION"') == 2
+    assert "3.9.25" not in setup
     assert "--smoke-test" in pipeline
     assert "glioma_seg.backends.mednext.smoke_gate" in pipeline
     assert "--stop-after-epoch 1" in pipeline

@@ -8,6 +8,7 @@ CODE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 PROJECT_ROOT="$(cd -- "$CODE_ROOT/.." && pwd -P)"
 MODEL_ENV="$CODE_ROOT/.venv-models"
 EVALUATOR_ENV="$CODE_ROOT/.venv-brats-metrics"
+EVALUATOR_PYTHON_VERSION="3.9.23"
 RECREATE=0
 BOOTSTRAP_PYTHON="$(command -v python3 || command -v python || true)"
 EVALUATOR_BOOTSTRAP=""
@@ -178,9 +179,11 @@ if [[ ! -x "$EVALUATOR_ENV/bin/python" ]]; then
     elif command -v python3.9 >/dev/null 2>&1; then
         python3.9 -m venv "$EVALUATOR_ENV"
     elif command -v conda >/dev/null 2>&1; then
-        conda create --prefix "$EVALUATOR_ENV" --yes python=3.9.25 pip
+        conda create --prefix "$EVALUATOR_ENV" --yes \
+            "python=$EVALUATOR_PYTHON_VERSION" pip
     elif command -v micromamba >/dev/null 2>&1; then
-        micromamba create --prefix "$EVALUATOR_ENV" --yes python=3.9.25 pip
+        micromamba create --prefix "$EVALUATOR_ENV" --yes \
+            "python=$EVALUATOR_PYTHON_VERSION" pip
     else
         die "Python 3.9/conda/micromamba is required for the pinned official BraTS evaluator. Ask the administrator for a user environment; do not use sudo."
     fi
@@ -213,5 +216,6 @@ echo
 echo "Research-model Linux environments are ready."
 echo "Model Python: $MODEL_PYTHON"
 echo "Evaluator Python: $EVALUATOR_PYTHON"
+echo "Evaluator Python pin: $EVALUATOR_PYTHON_VERSION"
 echo "Generated freezes: $LOCK_DIR"
 echo "No activation is required by the Linux pipeline runner."
