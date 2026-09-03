@@ -12,6 +12,7 @@ import os
 import pickle
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -577,6 +578,35 @@ def run_fold(
         fold_dir / f"gpu_samples_segment_invocation_{segment_index:02d}_{segment_stamp}.csv"
     )
     monitor = GPUMonitor(gpu_segment, interval_seconds=2.0).start()
+    heartbeat_stop = threading.Event()
+    heartbeat_phase = {"name": "initializing"}
+
+    def print_heartbeat() -> None:
+        heartbeat_started = time.monotonic()
+        while not heartbeat_stop.wait(30.0):
+            snapshot = monitor.latest
+            gpu_text = "GPU=waiting-for-first-sample"
+            if snapshot is not None:
+                power = "N/A" if snapshot.power_w is None else f"{snapshot.power_w:.0f}W"
+                gpu_text = (
+                    f"GPU={snapshot.gpu_utilization_percent:.0f}% "
+                    f"VRAM={snapshot.memory_used_mb:.0f}/{snapshot.memory_total_mb:.0f}MiB "
+                    f"Temp={snapshot.temperature_c:.0f}C Power={power}"
+                )
+            completed = len(getattr(trainer, "all_tr_losses", []))
+            print(
+                f"[MEDNEXT MONITOR] Experiment={spec.experiment_id} Fold={spec.fold} "
+                f"Phase={heartbeat_phase['name']} CompletedEpochs={completed}/{spec.epochs} "
+                f"Elapsed={(time.monotonic() - heartbeat_started) / 60.0:.1f}m {gpu_text}",
+                flush=True,
+            )
+
+    heartbeat = threading.Thread(
+        target=print_heartbeat,
+        name="mednext-terminal-heartbeat",
+        daemon=True,
+    )
+    heartbeat.start()
     started_at = _utc_now()
     training_started: float | None = None
     current_training_seconds = 0.0
@@ -602,6 +632,7 @@ def run_fold(
                 resume_path, _checkpoint_owner(spec, recipe)
             )
             trainer.load_checkpoint(str(resume_path), train=True)
+        heartbeat_phase["name"] = "training"
         training_started = time.monotonic()
         trainer.run_training()
         current_training_seconds = time.monotonic() - training_started
@@ -624,6 +655,7 @@ def run_fold(
                 f"MedNeXt training ended at {len(history)}/{spec.epochs} epochs "
                 "without final checkpoint"
             )
+        heartbeat_phase["name"] = "validation-inference"
         inference_started = time.monotonic()
         trainer.network.eval()
         trainer.validate(
@@ -652,6 +684,8 @@ def run_fold(
         )
         write_json_atomic(fold_dir / "validation_summary.json", validation)
     finally:
+        heartbeat_stop.set()
+        heartbeat.join(timeout=5.0)
         if training_started is not None and current_training_seconds == 0.0:
             current_training_seconds = time.monotonic() - training_started
         segment_summary = monitor.stop().to_dict()

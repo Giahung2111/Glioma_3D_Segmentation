@@ -1,8 +1,8 @@
 # -----------------------------------------------------------------------------
 # Local medical data and generated experiment state
 # -----------------------------------------------------------------------------
-/Datasets/
-/Workspace/
+/Datasets
+/Workspace
 /Checkpoints/
 /Models/
 /Outputs/

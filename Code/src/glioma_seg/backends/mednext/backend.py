@@ -119,8 +119,23 @@ def _git_output(repository: Path, *arguments: str) -> str:
 
 
 def _check_upstream(repository: Path) -> dict[str, Any]:
-    if not (repository / ".git").is_dir():
+    # A normal checkout may store ``.git`` as a directory, while a fresh
+    # ``git clone --recurse-submodules`` stores it as a gitfile that points to
+    # the superproject's module directory.  Ask Git itself instead of assuming
+    # one on-disk representation.  This is required for clean Linux/JupyterHub
+    # clones and does not alter the upstream checkout.
+    if not repository.is_dir():
         raise FileNotFoundError(f"Official MedNeXt repository is missing: {repository}")
+    try:
+        inside_work_tree = _git_output(repository, "rev-parse", "--is-inside-work-tree")
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise FileNotFoundError(
+            f"Official MedNeXt repository is not a readable Git checkout: {repository}"
+        ) from exc
+    if inside_work_tree.casefold() != "true":
+        raise FileNotFoundError(
+            f"Official MedNeXt repository is not a Git work tree: {repository}"
+        )
     commit = _git_output(repository, "rev-parse", "HEAD")
     if commit != EXPECTED_MEDNEXT_COMMIT:
         raise RuntimeError(
