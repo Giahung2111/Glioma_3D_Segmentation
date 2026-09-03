@@ -52,7 +52,7 @@ sang thư mục backup trên `/mnt/d`; lệnh không xóa dữ liệu.
 (
 set -e
 REPO=/var/tmp/henry-glioma-20260903/Glioma_3D_Segmentation
-STORE=/mnt/d/Henry/_storage/Glioma_3D_Segmentation_storage
+STORE=/mnt/d/Henry/_storage/Glioma_3D_Segmentation_data
 STAMP=$(date +%Y%m%d_%H%M%S)
 
 test -d "$REPO/.git"
@@ -89,8 +89,8 @@ echo "Workspace -> $(readlink -f Workspace)"
 Kết quả đúng phải là:
 
 ```text
-Datasets -> /mnt/d/Henry/_storage/Glioma_3D_Segmentation_storage/Datasets
-Workspace -> /mnt/d/Henry/_storage/Glioma_3D_Segmentation_storage/Workspace
+Datasets -> /mnt/d/Henry/_storage/Glioma_3D_Segmentation_data/Datasets
+Workspace -> /mnt/d/Henry/_storage/Glioma_3D_Segmentation_data/Workspace
 ```
 
 ## C. Upload và kiểm tra dataset
@@ -107,13 +107,27 @@ Upload nguyên thư mục:
 ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 ```
 
+Trong lúc upload bằng giao diện web, không reload/đóng tab và không để máy đang
+mở trình duyệt sleep. Reload thường hủy các file chưa gửi; những file đã ghi
+xong trên server vẫn được giữ lại. Nếu bị gián đoạn, không xóa thư mục partial:
+upload lại chính thư mục nguồn đầy đủ vào cùng thư mục `Datasets`, chấp nhận
+overwrite/merge các tên trùng nếu giao diện hỏi, rồi kiểm tra lại đủ 1.251 thư
+mục và 6.255 file. Pipeline vẫn chạy validation nội dung trước khi training.
+
 Vì `Datasets` là symbolic link, dữ liệu thật sẽ được ghi vào `/mnt/d`, không nằm
 trong `/var/tmp`.
+
+Ngay sau bước B, thư mục `Datasets` mới có thể đang trống. Lệnh
+`TRAIN=/mnt/...` ở dưới **chỉ gán một biến đường dẫn**; nó không tạo thư mục và
+không upload dữ liệu. Vì vậy, phải chờ upload xong và nhìn thấy thư mục
+`ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData` bên trong `Datasets` rồi mới
+chạy lệnh đếm.
 
 Sau khi giao diện báo upload xong, chạy:
 
 ```bash
-TRAIN=/mnt/d/Henry/_storage/Glioma_3D_Segmentation_storage/Datasets/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
+cd /var/tmp/henry-glioma-20260903/Glioma_3D_Segmentation
+TRAIN="$PWD/Datasets/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
 
 echo -n "Cases: "
 find "$TRAIN" -mindepth 1 -maxdepth 1 -type d -name 'BraTS-GLI-*' | wc -l
@@ -325,7 +339,7 @@ không khớp và không đoán experiment cần tiếp tục.
 Khi thành công, terminal in đường dẫn chính xác. Dạng chung là:
 
 ```text
-/mnt/d/Henry/_storage/Glioma_3D_Segmentation_storage/Workspace/reports/<EXPERIMENT_ID>
+/mnt/d/Henry/_storage/Glioma_3D_Segmentation_data/Workspace/reports/<EXPERIMENT_ID>
 ```
 
 File đọc đầu tiên:
