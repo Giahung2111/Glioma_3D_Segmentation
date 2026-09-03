@@ -1,0 +1,15 @@
+schema: glioma_model_experiment_recipe_v1
+backend: mednext
+model_config: ../models/mednext.yaml
+dataset: Dataset501_BraTS2023GLI
+split_source: Workspace/nnUNet_preprocessed/Dataset501_BraTS2023GLI/splits_final.json
+folds: [0, 1, 2, 3, 4]
+validation_case_counts: [251, 250, 250, 250, 250]
+epochs_per_fold: 100
+smoke:
+  fold: 0
+  epochs: 3
+  train_cases: 8
+  validation_cases: 2
+retain_probabilities: true
+full_training_requires_successful_smoke: true

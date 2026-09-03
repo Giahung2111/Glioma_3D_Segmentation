@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -311,6 +312,10 @@ def test_evaluation_analysis_visualization_and_reporting_integration(tmp_path: P
     )
 
     assert manifest.is_file()
+    with manifest.open("r", encoding="utf-8", newline="") as handle:
+        manifest_rows = list(csv.DictReader(handle))
+    assert manifest_rows[0]["figure_path"] == f"{case_id}_t1c_flair_gt_pred.png"
+    assert not Path(manifest_rows[0]["figure_path"]).is_absolute()
     assert (report_dir / "figures" / f"{case_id}_t1c_flair_gt_pred.png").stat().st_size > 0
     assert summary.is_file() and weekly.is_file()
     summary_text = summary.read_text(encoding="utf-8")

@@ -16,6 +16,7 @@ _TRAIN_LOSS_RE = re.compile(r"train(?:ing)?[_ ]loss\s*[: ]\s*(-?\d+(?:\.\d+)?(?:
 _VAL_LOSS_RE = re.compile(r"val(?:idation)?[_ ]loss\s*[: ]\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)", re.I)
 _PSEUDO_DICE_RE = re.compile(r"(?:pseudo[ _-]?dice|global[ _-]?dice)\s*[: ]\s*(.+)$", re.I)
 _EPOCH_TIME_RE = re.compile(r"epoch\s*time\s*[: ]\s*(\d+(?:\.\d+)?)\s*s?", re.I)
+_FINAL_VALIDATION_CASE_RE = re.compile(r"(?:^|\s)predicting\s+([A-Za-z0-9_.-]+)\s*$", re.I)
 
 
 @dataclass
@@ -25,6 +26,9 @@ class TrainingProgress:
     latest_validation_loss: float | None = None
     latest_pseudo_dice: str | None = None
     epoch_durations_seconds: list[float] | None = None
+    phase: str = "training"
+    final_validation_cases_started: int = 0
+    latest_validation_case: str | None = None
 
     def __post_init__(self) -> None:
         if self.epoch_durations_seconds is None:
@@ -42,6 +46,12 @@ class TrainingProgress:
         if match := _EPOCH_TIME_RE.search(line):
             assert self.epoch_durations_seconds is not None
             self.epoch_durations_seconds.append(float(match.group(1)))
+        if match := _FINAL_VALIDATION_CASE_RE.search(line):
+            self.phase = "final_validation"
+            self.final_validation_cases_started += 1
+            self.latest_validation_case = match.group(1)
+        if "validation complete" in line.casefold():
+            self.phase = "complete"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

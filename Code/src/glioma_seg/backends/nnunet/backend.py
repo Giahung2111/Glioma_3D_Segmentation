@@ -17,8 +17,10 @@ import os
 import platform
 import secrets
 import shutil
+import statistics
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -59,7 +61,16 @@ CONFIGURATION = "3d_fullres"
 PLANS_NAME = "nnUNetPlans"
 EXPECTED_UPSTREAM_COMMIT = "0e495086eb108ff79afe106291e8c15bd2f2bc3a"
 EXPECTED_UPSTREAM_VERSION = "2.8.1"
+BENCHMARK_TRAINER = "nnUNetTrainerBenchmark_5epochs"
 PRELIMINARY_TRAINERS = {"nnUNetTrainer_20epochs": 20, "nnUNetTrainer_50epochs": 50}
+COMPUTE_LIMITED_CV_TRAINERS = {"nnUNetTrainer_100epochs": 100}
+STANDARD_CV_TRAINERS = {"nnUNetTrainer": 1000}
+SUPPORTED_TRAINERS = {
+    **PRELIMINARY_TRAINERS,
+    **COMPUTE_LIMITED_CV_TRAINERS,
+    **STANDARD_CV_TRAINERS,
+}
+CV_TRAINERS = frozenset((*COMPUTE_LIMITED_CV_TRAINERS, *STANDARD_CV_TRAINERS))
 
 
 @dataclass(frozen=True)
@@ -425,21 +436,30 @@ class NNUNetV2Backend(SegmentationBackend):
             )
         experiment_dir = self._experiment_dir(identifier)
         experiment_dir.mkdir(parents=True, exist_ok=True)
-        for child in ("logs", "config_snapshot", "figures"):
+        for child in ("logs", "config_snapshot", "figures", "folds"):
             (experiment_dir / child).mkdir(exist_ok=True)
         manifest_path = experiment_dir / "experiment.json"
         if not manifest_path.exists():
+            if kind == "fullcv":
+                if trainer in COMPUTE_LIMITED_CV_TRAINERS:
+                    initial_classification = "compute_limited_cross_validation"
+                elif trainer in STANDARD_CV_TRAINERS:
+                    initial_classification = "standard_reference_baseline"
+                else:
+                    initial_classification = "pending_fullcv_trainer_selection"
+            elif kind == "prelim":
+                initial_classification = "preliminary_single_fold_baseline"
+            elif kind == "benchmark":
+                initial_classification = "benchmark_preflight"
+            else:
+                initial_classification = "custom_experiment"
             write_json_atomic(
                 manifest_path,
                 {
                     "experiment_id": identifier,
                     "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "experiment_kind": kind,
-                    "baseline_classification": (
-                        "standard_reference_baseline"
-                        if kind in {"prelim", "fullcv", "benchmark"}
-                        else "custom_experiment"
-                    ),
+                    "baseline_classification": initial_classification,
                     "upstream_source_modified": False,
                     "dataset": self.dataset_name,
                     "dataset_id": self.dataset_id,
@@ -455,6 +475,13 @@ class NNUNetV2Backend(SegmentationBackend):
             )
         return identifier
 
+    def _fold_report_dir(self, experiment_id: str, fold: int) -> Path:
+        if fold not in range(5):
+            raise ValueError("fold must be one of 0, 1, 2, 3, 4")
+        path = self._experiment_dir(experiment_id) / "folds" / f"fold_{fold}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def _update_manifest(self, experiment_id: str, updates: Mapping[str, Any]) -> None:
         manifest_path = self._experiment_dir(experiment_id) / "experiment.json"
         manifest: dict[str, Any] = (
@@ -467,6 +494,65 @@ class NNUNetV2Backend(SegmentationBackend):
                 manifest["command_history"] = history
             manifest[key] = value
         write_json_atomic(manifest_path, manifest)
+
+    def _update_fold_run(
+        self,
+        experiment_id: str,
+        fold: int,
+        updates: Mapping[str, Any],
+    ) -> None:
+        """Merge one fold's provenance without overwriting sibling fold records."""
+
+        manifest_path = self._experiment_dir(experiment_id) / "experiment.json"
+        manifest = load_json(manifest_path)
+        fold_runs = dict(manifest.get("fold_runs", {}))
+        fold_key = str(fold)
+        fold_record = dict(fold_runs.get(fold_key, {}))
+        fold_record.update(updates)
+        fold_runs[fold_key] = fold_record
+        manifest["fold_runs"] = fold_runs
+        write_json_atomic(manifest_path, manifest)
+
+    def _assert_experiment_compatible(self, experiment_id: str, trainer: str) -> None:
+        """Prevent an existing experiment ID from silently changing scientific identity."""
+
+        manifest_path = self._experiment_dir(experiment_id) / "experiment.json"
+        manifest = load_json(manifest_path)
+        expected = {
+            "dataset": self.dataset_name,
+            "dataset_id": self.dataset_id,
+            "configuration": self.configuration,
+        }
+        mismatches = {
+            field: (manifest.get(field), value)
+            for field, value in expected.items()
+            if manifest.get(field) != value
+        }
+        recorded_trainer = manifest.get("trainer")
+        legacy_benchmark_only = (
+            recorded_trainer == BENCHMARK_TRAINER
+            and not manifest.get("trainer_output_owner")
+            and not manifest.get("fold_runs")
+        )
+        if recorded_trainer not in (None, trainer) and not legacy_benchmark_only:
+            mismatches["trainer"] = (recorded_trainer, trainer)
+        if mismatches:
+            raise ValueError(
+                f"Experiment {experiment_id!r} is incompatible with this run: {mismatches}"
+            )
+
+    def _record_benchmark_manifest(
+        self,
+        experiment_id: str,
+        summary: Mapping[str, Any],
+    ) -> None:
+        """Record benchmark evidence without claiming it is the scientific trainer."""
+
+        manifest_updates = dict(summary)
+        benchmark_trainer = manifest_updates.pop("trainer", BENCHMARK_TRAINER)
+        manifest_updates["benchmark_trainer"] = benchmark_trainer
+        manifest_updates["benchmark_summary"] = dict(summary)
+        self._update_manifest(experiment_id, manifest_updates)
 
     def _snapshot_reproducibility(
         self,
@@ -506,6 +592,396 @@ class NNUNetV2Backend(SegmentationBackend):
             "trainer": trainer,
             "fold": fold,
         }
+
+    @staticmethod
+    def _case_ids_with_suffix(directory: Path, suffix: str) -> tuple[set[str], list[str]]:
+        paths = sorted(directory.glob(f"*{suffix}")) if directory.is_dir() else []
+        case_ids = {path.name[: -len(suffix)] for path in paths}
+        empty = [str(path) for path in paths if path.stat().st_size <= 0]
+        return case_ids, empty
+
+    def _expected_validation_ids(self, fold: int) -> set[str]:
+        if fold not in range(5):
+            raise ValueError("fold must be one of 0, 1, 2, 3, 4")
+        splits_path = self.dataset_preprocessed_dir / "splits_final.json"
+        if not splits_path.is_file():
+            raise FileNotFoundError(f"Official split file is missing: {splits_path}")
+        with splits_path.open("r", encoding="utf-8") as handle:
+            splits = json.load(handle)
+        if not isinstance(splits, list) or len(splits) != 5:
+            raise ValueError(f"Expected exactly five folds in {splits_path}")
+        entry = splits[fold]
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"Fold {fold} is invalid in {splits_path}")
+        train_ids = {str(value) for value in entry.get("train", [])}
+        validation_ids = {str(value) for value in entry.get("val", [])}
+        if not train_ids or not validation_ids or not train_ids.isdisjoint(validation_ids):
+            raise ValueError(f"Fold {fold} is not a valid non-empty disjoint split")
+        return validation_ids
+
+    def audit_fold_artifacts(
+        self,
+        *,
+        experiment_id: str,
+        trainer: str,
+        fold: int,
+        require_probabilities: bool = True,
+        record: bool = False,
+    ) -> dict[str, Any]:
+        """Strictly prove that one official fold and its validation are complete."""
+
+        if trainer not in SUPPORTED_TRAINERS:
+            raise ValueError(f"Unsupported official trainer for fold audit: {trainer}")
+        self._assert_experiment_compatible(experiment_id, trainer)
+        expected_ids = self._expected_validation_ids(fold)
+        fold_output = self._model_output_folder(trainer) / f"fold_{fold}"
+        validation_dir = fold_output / "validation"
+        checks: list[dict[str, Any]] = []
+
+        def add(name: str, ok: bool, detail: str) -> None:
+            checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+        checkpoint_paths = {
+            name: fold_output / name
+            for name in ("checkpoint_final.pth", "checkpoint_latest.pth", "checkpoint_best.pth")
+        }
+        available_checkpoints = [
+            name
+            for name, path in checkpoint_paths.items()
+            if path.is_file() and path.stat().st_size > 0
+        ]
+        checkpoint_files_present = sorted(
+            str(path) for path in fold_output.rglob("checkpoint_*.pth") if path.is_file()
+        )
+        checkpoint_state = next(
+            (name for name in checkpoint_paths if name in available_checkpoints),
+            "none",
+        )
+        final_ok = "checkpoint_final.pth" in available_checkpoints
+        add(
+            "final checkpoint",
+            final_ok,
+            str(checkpoint_paths["checkpoint_final.pth"]),
+        )
+
+        owner_path = self._model_owner_path(trainer, fold)
+        owner_ok = False
+        owner_detail = f"Missing or invalid: {owner_path}"
+        try:
+            actual_owner = load_json(owner_path)
+            expected_owner = self._model_owner(experiment_id, trainer, fold)
+            owner_ok = actual_owner == expected_owner
+            owner_detail = f"actual={actual_owner}, expected={expected_owner}"
+        except (OSError, ValueError, TypeError) as exc:
+            owner_detail = f"{type(exc).__name__}: {exc}"
+        add("experiment ownership", owner_ok, owner_detail)
+
+        add("validation directory", validation_dir.is_dir(), str(validation_dir))
+        suffixes = [".nii.gz"] + ([".npz", ".pkl"] if require_probabilities else [])
+        inventories: dict[str, Any] = {}
+        validation_case_count = 0
+        for suffix in suffixes:
+            actual_ids, empty_files = self._case_ids_with_suffix(validation_dir, suffix)
+            if suffix == ".nii.gz":
+                validation_case_count = len(actual_ids)
+            missing = sorted(expected_ids - actual_ids)
+            extra = sorted(actual_ids - expected_ids)
+            inventory_ok = not missing and not extra and not empty_files
+            inventories[suffix] = {
+                "expected": len(expected_ids),
+                "actual": len(actual_ids),
+                "missing": missing,
+                "extra": extra,
+                "empty_files": empty_files,
+            }
+            add(
+                f"exact validation {suffix} inventory",
+                inventory_ok,
+                (
+                    f"expected={len(expected_ids)}, actual={len(actual_ids)}, "
+                    f"missing={len(missing)}, extra={len(extra)}, empty={len(empty_files)}"
+                ),
+            )
+
+        summary_path = validation_dir / "summary.json"
+        summary_ok = False
+        summary_case_ids: set[str] = set()
+        summary_detail = f"Missing: {summary_path}"
+        try:
+            summary = load_json(summary_path)
+            metric_rows = summary.get("metric_per_case")
+            if isinstance(metric_rows, list):
+                for row in metric_rows:
+                    if not isinstance(row, Mapping):
+                        continue
+                    prediction_file = row.get("prediction_file")
+                    if isinstance(prediction_file, str):
+                        name = Path(prediction_file).name
+                        if name.endswith(".nii.gz"):
+                            summary_case_ids.add(name.removesuffix(".nii.gz"))
+            summary_ok = summary_case_ids == expected_ids
+            summary_detail = (
+                f"expected_cases={len(expected_ids)}, metric_cases={len(summary_case_ids)}, "
+                f"missing={len(expected_ids - summary_case_ids)}, "
+                f"extra={len(summary_case_ids - expected_ids)}"
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            summary_detail = f"{type(exc).__name__}: {exc}"
+        add("validation summary case inventory", summary_ok, summary_detail)
+
+        complete = all(check["ok"] for check in checks)
+        safe_to_resume = owner_ok and bool(available_checkpoints)
+        safe_to_restart = (
+            owner_ok and fold_output.is_dir() and not checkpoint_files_present
+        )
+        audit: dict[str, Any] = {
+            "complete": complete,
+            "valid": complete,
+            "safe_to_resume": safe_to_resume,
+            "safe_to_restart": safe_to_restart,
+            "experiment_id": experiment_id,
+            "dataset_id": self.dataset_id,
+            "dataset_name": self.dataset_name,
+            "configuration": self.configuration,
+            "trainer": trainer,
+            "fold": fold,
+            "require_probabilities": require_probabilities,
+            "expected_validation_cases": len(expected_ids),
+            "validation_case_count": validation_case_count,
+            "fold_output": str(fold_output),
+            "validation_dir": str(validation_dir),
+            "checkpoint_state": checkpoint_state,
+            "available_checkpoints": available_checkpoints,
+            "checkpoint_files_present": checkpoint_files_present,
+            "summary_file": str(summary_path),
+            "owner_file": str(owner_path),
+            "inventories": inventories,
+            "checks": checks,
+        }
+        if record:
+            self._update_fold_run(
+                experiment_id,
+                fold,
+                {
+                    "artifact_status": "COMPLETE" if complete else "INCOMPLETE",
+                    "artifact_audit": audit,
+                    "safe_to_resume": safe_to_resume,
+                    "safe_to_restart": safe_to_restart,
+                    "trainer_output": str(fold_output),
+                    "checkpoint_paths": [
+                        str(checkpoint_paths[name]) for name in available_checkpoints
+                    ],
+                },
+            )
+        return audit
+
+    def archive_restartable_fold(
+        self,
+        *,
+        experiment_id: str,
+        trainer: str,
+        fold: int,
+    ) -> dict[str, Any]:
+        """Atomically preserve an owned checkpointless fold before a fresh restart."""
+
+        audit = self.audit_fold_artifacts(
+            experiment_id=experiment_id,
+            trainer=trainer,
+            fold=fold,
+            require_probabilities=True,
+            record=True,
+        )
+        if not audit["safe_to_restart"]:
+            raise RuntimeError(
+                "Fold cannot be archived for restart: exact ownership, an existing fold "
+                "directory, and zero checkpoint_*.pth files are all required."
+            )
+
+        model_dir = self._model_output_folder(trainer).resolve()
+        fold_output = model_dir / f"fold_{fold}"
+        resolved_fold = fold_output.resolve()
+        if resolved_fold.parent != model_dir or resolved_fold.name != f"fold_{fold}":
+            raise RuntimeError(
+                f"Refusing to archive fold outside its exact model directory: {resolved_fold}"
+            )
+
+        expected_owner = self._model_owner(experiment_id, trainer, fold)
+        owner_path = resolved_fold / "glioma_experiment_owner.json"
+        actual_owner = load_json(owner_path)
+        if actual_owner != expected_owner:
+            raise RuntimeError(
+                f"Fold ownership changed before archive: actual={actual_owner}, "
+                f"expected={expected_owner}"
+            )
+        checkpoints_before = sorted(
+            path for path in resolved_fold.rglob("checkpoint_*.pth") if path.is_file()
+        )
+        if checkpoints_before:
+            raise RuntimeError(
+                "A checkpoint appeared before archive; refusing to restart: "
+                + ", ".join(str(path) for path in checkpoints_before)
+            )
+
+        timestamp = dt.datetime.now(dt.timezone.utc)
+        archive_path = model_dir / (
+            f"glioma_arch_f{fold}_{timestamp.strftime('%Y%m%dT%H%M%SZ')}_"
+            f"{secrets.token_hex(3)}"
+        )
+        resolved_archive = archive_path.resolve()
+        if resolved_archive.parent != model_dir or resolved_archive.exists():
+            raise RuntimeError(f"Unsafe or occupied restart archive path: {resolved_archive}")
+
+        os.replace(resolved_fold, resolved_archive)
+        checkpoints_after = sorted(
+            path for path in resolved_archive.rglob("checkpoint_*.pth") if path.is_file()
+        )
+        owner_after = load_json(resolved_archive / "glioma_experiment_owner.json")
+        safe_to_start_fresh = owner_after == expected_owner and not checkpoints_after
+        archive_record: dict[str, Any] = {
+            "schema": "glioma_nnunet_restart_archive_v1",
+            "experiment_id": experiment_id,
+            "trainer": trainer,
+            "fold": fold,
+            "archived_at": timestamp.isoformat(),
+            "source": str(resolved_fold),
+            "archive": str(resolved_archive),
+            "reason": "owned_fold_without_checkpoint",
+            "owner": owner_after,
+            "checkpoint_files_after_archive": [str(path) for path in checkpoints_after],
+            "safe_to_start_fresh": safe_to_start_fresh,
+            "prearchive_audit": audit,
+        }
+        write_json_atomic(
+            resolved_archive / "glioma_restart_archive.json",
+            archive_record,
+        )
+
+        manifest = load_json(self._experiment_dir(experiment_id) / "experiment.json")
+        fold_record = dict(manifest.get("fold_runs", {}).get(str(fold), {}))
+        restart_archives = list(fold_record.get("restart_archives", []))
+        restart_archives.append(
+            {
+                "archived_at": archive_record["archived_at"],
+                "archive": archive_record["archive"],
+                "reason": archive_record["reason"],
+                "safe_to_start_fresh": safe_to_start_fresh,
+            }
+        )
+        self._update_fold_run(
+            experiment_id,
+            fold,
+            {
+                "restart_archives": restart_archives,
+                "restart_archive_latest": str(resolved_archive),
+                "restart_status": "ARCHIVED_CHECKPOINTLESS_FOLD",
+                "safe_to_resume": False,
+                "safe_to_restart": False,
+            },
+        )
+        if not safe_to_start_fresh:
+            raise RuntimeError(
+                "Fold changed during its atomic archive. Evidence was preserved, but a fresh "
+                f"restart is blocked pending inspection: {resolved_archive}"
+            )
+        return archive_record
+
+    def _write_cv_aggregate_telemetry(self, experiment_id: str) -> None:
+        """Materialize explicit cross-fold summaries without impersonating single-fold files."""
+
+        runtime_folds: dict[str, Any] = {}
+        gpu_folds: dict[str, Any] = {}
+        for fold in range(5):
+            fold_dir = self._fold_report_dir(experiment_id, fold)
+            runtime_path = fold_dir / "runtime.json"
+            gpu_path = fold_dir / "gpu_summary.json"
+            if runtime_path.is_file():
+                runtime_folds[str(fold)] = load_json(runtime_path)
+            if gpu_path.is_file():
+                gpu_folds[str(fold)] = load_json(gpu_path)
+
+        runtime_values = list(runtime_folds.values())
+        epoch_means = [
+            float(record["average_seconds_per_epoch"])
+            for record in runtime_values
+            if isinstance(record.get("average_seconds_per_epoch"), int | float)
+            and math.isfinite(float(record["average_seconds_per_epoch"]))
+        ]
+        runtime_summary = {
+            "schema": "glioma_cv_runtime_v1",
+            "experiment_id": experiment_id,
+            "folds_recorded": len(runtime_folds),
+            "folds": runtime_folds,
+            "total_training_seconds": sum(
+                float(record.get("total_seconds", 0.0))
+                for record in runtime_values
+                if isinstance(record.get("total_seconds"), int | float)
+            ),
+            "mean_seconds_per_epoch_across_folds": (
+                sum(epoch_means) / len(epoch_means) if epoch_means else None
+            ),
+        }
+        write_json_atomic(
+            self._experiment_dir(experiment_id) / "cv_runtime_summary.json",
+            runtime_summary,
+        )
+
+        gpu_values = list(gpu_folds.values())
+        total_samples = sum(
+            int(record.get("samples", 0))
+            for record in gpu_values
+            if isinstance(record.get("samples"), int)
+            and not isinstance(record.get("samples"), bool)
+        )
+
+        def weighted(field: str) -> float | None:
+            numerator = 0.0
+            denominator = 0
+            for record in gpu_values:
+                samples = record.get("samples")
+                value = record.get(field)
+                if (
+                    isinstance(samples, int)
+                    and not isinstance(samples, bool)
+                    and samples > 0
+                    and isinstance(value, int | float)
+                    and math.isfinite(float(value))
+                ):
+                    numerator += float(value) * samples
+                    denominator += samples
+            return numerator / denominator if denominator else None
+
+        def maximum(field: str) -> float | None:
+            values = [
+                float(record[field])
+                for record in gpu_values
+                if isinstance(record.get(field), int | float)
+                and math.isfinite(float(record[field]))
+            ]
+            return max(values) if values else None
+
+        energy_values = [
+            float(record["estimated_energy_wh"])
+            for record in gpu_values
+            if isinstance(record.get("estimated_energy_wh"), int | float)
+            and math.isfinite(float(record["estimated_energy_wh"]))
+        ]
+        gpu_summary = {
+            "schema": "glioma_cv_gpu_v1",
+            "experiment_id": experiment_id,
+            "folds_recorded": len(gpu_folds),
+            "samples": total_samples,
+            "folds": gpu_folds,
+            "peak_memory_used_mb": maximum("peak_memory_used_mb"),
+            "dedicated_memory_total_mb": maximum("dedicated_memory_total_mb"),
+            "mean_gpu_utilization_percent": weighted("mean_gpu_utilization_percent"),
+            "peak_temperature_c": maximum("peak_temperature_c"),
+            "mean_power_w": weighted("mean_power_w"),
+            "estimated_energy_wh": sum(energy_values) if energy_values else None,
+        }
+        write_json_atomic(
+            self._experiment_dir(experiment_id) / "cv_gpu_summary.json",
+            gpu_summary,
+        )
 
     def _benchmark_result_path(self) -> Path:
         return (
@@ -618,6 +1094,244 @@ class NNUNetV2Backend(SegmentationBackend):
         )
         return ok, detail, summary
 
+    def _update_fold_attempt(
+        self,
+        experiment_id: str,
+        fold: int,
+        attempt: int,
+        updates: Mapping[str, Any],
+    ) -> None:
+        manifest_path = self._experiment_dir(experiment_id) / "experiment.json"
+        manifest = load_json(manifest_path)
+        fold_runs = dict(manifest.get("fold_runs", {}))
+        fold_key = str(fold)
+        fold_record = dict(fold_runs.get(fold_key, {}))
+        attempts = [
+            dict(value)
+            for value in fold_record.get("attempts", [])
+            if isinstance(value, Mapping)
+        ]
+        attempt_record = next(
+            (value for value in attempts if value.get("attempt") == attempt),
+            None,
+        )
+        if attempt_record is None:
+            attempt_record = {"attempt": attempt}
+            attempts.append(attempt_record)
+        attempt_record.update(updates)
+        attempts.sort(key=lambda value: int(value.get("attempt", 0)))
+        fold_record["attempts"] = attempts
+        fold_runs[fold_key] = fold_record
+        manifest["fold_runs"] = fold_runs
+        write_json_atomic(manifest_path, manifest)
+
+    def _preserve_legacy_fold_attempt(self, experiment_id: str, fold: int) -> None:
+        """Copy pre-attempt-layout evidence before a resumed invocation can replace it."""
+
+        fold_dir = self._fold_report_dir(experiment_id, fold)
+        attempts_dir = fold_dir / "attempts"
+        attempts_dir.mkdir(parents=True, exist_ok=True)
+        if any(attempts_dir.glob("attempt_*")):
+            return
+        canonical_runtime = fold_dir / "runtime.json"
+        canonical_gpu = fold_dir / "gpu_summary.json"
+        canonical_log = self._experiment_dir(experiment_id) / "logs" / f"train_fold_{fold}.log"
+        if not any(path.is_file() for path in (canonical_runtime, canonical_gpu, canonical_log)):
+            return
+        legacy_dir = attempts_dir / "attempt_001"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        copied: dict[str, Any] = {"status": "LEGACY_PRESERVED"}
+        for source, name, key in (
+            (canonical_runtime, "runtime.json", "runtime_file"),
+            (canonical_gpu, "gpu_summary.json", "gpu_summary_file"),
+            (canonical_log, "train.log", "log_file"),
+        ):
+            if source.is_file():
+                destination = legacy_dir / name
+                shutil.copy2(source, destination)
+                copied[key] = str(destination)
+        manifest = load_json(self._experiment_dir(experiment_id) / "experiment.json")
+        fold_record = manifest.get("fold_runs", {}).get(str(fold), {})
+        if isinstance(fold_record, Mapping) and isinstance(
+            fold_record.get("gpu_telemetry_csv"), str
+        ):
+            copied["gpu_telemetry_csv"] = str(fold_record["gpu_telemetry_csv"])
+        copied["legacy_preserved"] = True
+        self._update_fold_attempt(experiment_id, fold, 1, copied)
+
+    def _allocate_fold_attempt(self, experiment_id: str, fold: int) -> tuple[int, Path]:
+        self._preserve_legacy_fold_attempt(experiment_id, fold)
+        attempts_dir = self._fold_report_dir(experiment_id, fold) / "attempts"
+        attempts_dir.mkdir(parents=True, exist_ok=True)
+        indices = [
+            int(path.name.removeprefix("attempt_"))
+            for path in attempts_dir.glob("attempt_*")
+            if path.is_dir() and path.name.removeprefix("attempt_").isdigit()
+        ]
+        attempt = max(indices, default=0) + 1
+        attempt_dir = attempts_dir / f"attempt_{attempt:03d}"
+        attempt_dir.mkdir(parents=True, exist_ok=False)
+        return attempt, attempt_dir
+
+    def _aggregate_fold_attempt_artifacts(
+        self,
+        experiment_id: str,
+        fold: int,
+    ) -> dict[str, Any]:
+        """Build canonical cumulative fold evidence while retaining each invocation."""
+
+        fold_dir = self._fold_report_dir(experiment_id, fold)
+        attempts_dir = fold_dir / "attempts"
+        attempt_dirs = sorted(
+            (path for path in attempts_dir.glob("attempt_*") if path.is_dir()),
+            key=lambda path: path.name,
+        )
+        runtime_records: list[tuple[Path, dict[str, Any]]] = []
+        gpu_records: list[tuple[Path, dict[str, Any]]] = []
+        for attempt_dir in attempt_dirs:
+            runtime_path = attempt_dir / "runtime.json"
+            gpu_path = attempt_dir / "gpu_summary.json"
+            if runtime_path.is_file():
+                runtime_records.append((runtime_path, load_json(runtime_path)))
+            if gpu_path.is_file():
+                gpu_records.append((gpu_path, load_json(gpu_path)))
+
+        canonical_runtime = fold_dir / "runtime.json"
+        if runtime_records:
+            durations = [
+                float(duration)
+                for _, record in runtime_records
+                for duration in record.get("epoch_durations_seconds", [])
+                if isinstance(duration, int | float) and math.isfinite(float(duration))
+            ]
+            total_seconds = sum(
+                float(record.get("total_seconds", 0.0))
+                for _, record in runtime_records
+                if isinstance(record.get("total_seconds"), int | float)
+                and math.isfinite(float(record["total_seconds"]))
+            )
+            target_epochs = next(
+                (
+                    int(record["number_of_epochs"])
+                    for _, record in reversed(runtime_records)
+                    if isinstance(record.get("number_of_epochs"), int)
+                ),
+                None,
+            )
+            runtime_payload = {
+                "schema": "glioma_fold_runtime_attempt_aggregate_v1",
+                "stage": "train",
+                "started_at": runtime_records[0][1].get("started_at"),
+                "ended_at": runtime_records[-1][1].get("ended_at"),
+                "total_seconds": total_seconds,
+                "total_hours": total_seconds / 3600.0,
+                "number_of_epochs": target_epochs,
+                "average_seconds_per_epoch": statistics.fmean(durations) if durations else None,
+                "epoch_seconds_min": min(durations) if durations else None,
+                "epoch_seconds_median": statistics.median(durations) if durations else None,
+                "epoch_seconds_max": max(durations) if durations else None,
+                "epoch_durations_seconds": durations,
+                "epochs_observed_across_attempts": len(durations),
+                "attempt_count": len(runtime_records),
+                "attempt_runtime_files": [str(path) for path, _ in runtime_records],
+            }
+            write_json_atomic(canonical_runtime, runtime_payload)
+
+        canonical_gpu = fold_dir / "gpu_summary.json"
+        if gpu_records:
+            total_samples = sum(
+                int(record.get("samples", 0))
+                for _, record in gpu_records
+                if isinstance(record.get("samples"), int)
+                and not isinstance(record.get("samples"), bool)
+            )
+
+            def maximum(field: str) -> float | None:
+                values = [
+                    float(record[field])
+                    for _, record in gpu_records
+                    if isinstance(record.get(field), int | float)
+                    and math.isfinite(float(record[field]))
+                ]
+                return max(values) if values else None
+
+            def weighted(field: str) -> float | None:
+                numerator = 0.0
+                denominator = 0
+                for _, record in gpu_records:
+                    samples = record.get("samples")
+                    value = record.get(field)
+                    if (
+                        isinstance(samples, int)
+                        and not isinstance(samples, bool)
+                        and samples > 0
+                        and isinstance(value, int | float)
+                        and math.isfinite(float(value))
+                    ):
+                        numerator += float(value) * samples
+                        denominator += samples
+                return numerator / denominator if denominator else None
+
+            errors = [
+                str(error)
+                for _, record in gpu_records
+                for error in record.get("errors", [])
+            ]
+            runtime_by_attempt = {
+                path.parent.name: record for path, record in runtime_records
+            }
+            energy_wh_values = [
+                float(record["mean_power_w"])
+                * float(runtime_by_attempt[path.parent.name]["total_seconds"])
+                / 3600.0
+                for path, record in gpu_records
+                if path.parent.name in runtime_by_attempt
+                and isinstance(record.get("mean_power_w"), int | float)
+                and math.isfinite(float(record["mean_power_w"]))
+                and isinstance(
+                    runtime_by_attempt[path.parent.name].get("total_seconds"), int | float
+                )
+                and math.isfinite(
+                    float(runtime_by_attempt[path.parent.name]["total_seconds"])
+                )
+            ]
+            gpu_payload = {
+                "schema": "glioma_fold_gpu_attempt_aggregate_v1",
+                "samples": total_samples,
+                "peak_memory_used_mb": maximum("peak_memory_used_mb"),
+                "dedicated_memory_total_mb": maximum("dedicated_memory_total_mb"),
+                "mean_gpu_utilization_percent": weighted("mean_gpu_utilization_percent"),
+                "peak_temperature_c": maximum("peak_temperature_c"),
+                "mean_power_w": weighted("mean_power_w"),
+                "estimated_energy_wh": (
+                    sum(energy_wh_values) if energy_wh_values else None
+                ),
+                "backend": "attempt_aggregate",
+                "errors": errors,
+                "attempt_count": len(gpu_records),
+                "attempt_gpu_summary_files": [str(path) for path, _ in gpu_records],
+            }
+            write_json_atomic(canonical_gpu, gpu_payload)
+
+        combined_log = self._experiment_dir(experiment_id) / "logs" / f"train_fold_{fold}.log"
+        log_paths = [path / "train.log" for path in attempt_dirs if (path / "train.log").is_file()]
+        if log_paths:
+            temporary = combined_log.with_suffix(combined_log.suffix + ".tmp")
+            temporary.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                for path in log_paths:
+                    handle.write(f"===== {path.parent.name} | {path} =====\n")
+                    handle.write(path.read_text(encoding="utf-8", errors="replace"))
+                    handle.write("\n")
+            temporary.replace(combined_log)
+
+        return {
+            "runtime_file": str(canonical_runtime) if canonical_runtime.is_file() else None,
+            "gpu_summary_file": str(canonical_gpu) if canonical_gpu.is_file() else None,
+            "log_file": str(combined_log) if combined_log.is_file() else None,
+            "attempt_count": len(attempt_dirs),
+        }
+
     def _execute(
         self,
         spec: CommandSpec,
@@ -627,29 +1341,68 @@ class NNUNetV2Backend(SegmentationBackend):
         trainer: str,
         monitor_gpu: bool,
         number_of_epochs: int | None = None,
+        fold_scoped: bool = False,
+        expected_validation_cases: int | None = None,
+        resume_attempt: bool = False,
     ) -> LiveCommandResult:
         command = self._official_command(spec)
         experiment_dir = self._experiment_dir(experiment_id)
-        log_path = experiment_dir / "logs" / f"{spec.stage}.log"
+        attempt_number: int | None = None
+        if fold_scoped:
+            attempt_number, artifact_dir = self._allocate_fold_attempt(experiment_id, fold)
+            log_path = artifact_dir / "train.log"
+        else:
+            artifact_dir = experiment_dir
+            log_path = experiment_dir / "logs" / f"{spec.stage}.log"
         workers = recommend_augmentation_workers()
         environment = self.paths.environment(augmentation_workers=workers)
         progress: NNUNetProcessMonitor | None = None
         gpu_monitor: GPUMonitor | None = None
         gpu_summary: dict[str, Any] | None = None
         gpu_summary_path: Path | None = None
+        telemetry_csv_path: Path | None = None
         if monitor_gpu:
             telemetry_name = (
-                f"{experiment_id}_gpu.csv"
+                f"{experiment_id}_fold_{fold}_{spec.stage}_attempt_{attempt_number:03d}_gpu.csv"
+                if fold_scoped
+                else f"{experiment_id}_gpu.csv"
                 if spec.stage == "train"
                 else f"{experiment_id}_{spec.stage}_gpu.csv"
             )
-            gpu_monitor = GPUMonitor(self.paths.telemetry / telemetry_name, interval_seconds=2.0)
+            telemetry_csv_path = self.paths.telemetry / telemetry_name
+            gpu_monitor = GPUMonitor(telemetry_csv_path, interval_seconds=2.0)
             gpu_monitor.start()
         if spec.stage in {"train", "benchmark"}:
-            progress = NNUNetProcessMonitor(experiment_id, fold, trainer, gpu_monitor)
+            progress = NNUNetProcessMonitor(
+                experiment_id,
+                fold,
+                trainer,
+                gpu_monitor,
+                target_epochs=number_of_epochs,
+                expected_validation_cases=expected_validation_cases,
+            )
 
         result: LiveCommandResult | None = None
         failure: LiveCommandError | None = None
+        exceptional_failure: BaseException | None = None
+        fallback_started_at = dt.datetime.now(dt.timezone.utc)
+        fallback_started_monotonic = time.monotonic()
+        if fold_scoped:
+            assert attempt_number is not None
+            self._update_fold_attempt(
+                experiment_id,
+                fold,
+                attempt_number,
+                {
+                    "status": "RUNNING",
+                    "resume": resume_attempt,
+                    "started_at": fallback_started_at.isoformat(),
+                    "log_file": str(log_path),
+                    "gpu_telemetry_csv": (
+                        str(telemetry_csv_path) if telemetry_csv_path is not None else None
+                    ),
+                },
+            )
         try:
             result = run_live_command(
                 command.argv,
@@ -664,19 +1417,98 @@ class NNUNetV2Backend(SegmentationBackend):
         except LiveCommandError as exc:
             result = exc.result
             failure = exc
+        except BaseException as exc:
+            # In particular, retain auditable INTERRUPTED state after Ctrl+C.
+            exceptional_failure = exc
         finally:
             if gpu_monitor:
                 gpu_summary = gpu_monitor.stop().to_dict()
                 summary_name = (
                     "gpu_summary.json"
-                    if spec.stage == "train"
+                    if fold_scoped or spec.stage == "train"
                     else f"{spec.stage}_gpu_summary.json"
                 )
-                gpu_summary_path = experiment_dir / summary_name
+                gpu_summary_path = artifact_dir / summary_name
                 write_json_atomic(gpu_summary_path, gpu_summary)
 
-        assert result is not None
         epoch_durations = progress.progress.epoch_durations_seconds if progress else []
+        if result is None:
+            ended_at = dt.datetime.now(dt.timezone.utc)
+            total_seconds = time.monotonic() - fallback_started_monotonic
+            runtime = build_runtime_record(
+                stage=spec.stage,
+                started_at=fallback_started_at.isoformat(),
+                ended_at=ended_at.isoformat(),
+                total_seconds=total_seconds,
+                number_of_epochs=number_of_epochs,
+                epoch_durations_seconds=epoch_durations or (),
+            )
+            runtime_path = artifact_dir / (
+                "runtime.json"
+                if fold_scoped or spec.stage == "train"
+                else f"runtime_{spec.stage}.json"
+            )
+            runtime_payload = runtime.to_dict()
+            runtime_payload["epoch_durations_seconds"] = list(epoch_durations or ())
+            runtime_payload["epochs_observed_this_attempt"] = len(epoch_durations or ())
+            write_json_atomic(runtime_path, runtime_payload)
+            status = (
+                "INTERRUPTED"
+                if isinstance(exceptional_failure, KeyboardInterrupt)
+                else "FAILED"
+            )
+            updates: dict[str, Any] = {
+                "command": format_command(command.argv),
+                "nnUNet_n_proc_DA": workers,
+                f"{spec.stage}_start": fallback_started_at.isoformat(),
+                f"{spec.stage}_end": ended_at.isoformat(),
+                f"{spec.stage}_seconds": total_seconds,
+                "stage_status": status,
+                "failure_type": (
+                    type(exceptional_failure).__name__
+                    if exceptional_failure is not None
+                    else "Unknown"
+                ),
+                "log_file": str(log_path),
+                "runtime_file": str(runtime_path),
+            }
+            if gpu_summary_path is not None:
+                updates["gpu_summary_file"] = str(gpu_summary_path)
+            if telemetry_csv_path is not None:
+                updates["gpu_telemetry_csv"] = str(telemetry_csv_path)
+            self._update_manifest(experiment_id, {"command": updates.pop("command")})
+            if fold_scoped:
+                assert attempt_number is not None
+                self._update_fold_attempt(
+                    experiment_id,
+                    fold,
+                    attempt_number,
+                    {
+                        **updates,
+                        "status": status,
+                        "ended_at": ended_at.isoformat(),
+                        "runtime_file": str(runtime_path),
+                        "gpu_summary_file": (
+                            str(gpu_summary_path) if gpu_summary_path is not None else None
+                        ),
+                    },
+                )
+                cumulative = self._aggregate_fold_attempt_artifacts(experiment_id, fold)
+                self._update_fold_run(
+                    experiment_id,
+                    fold,
+                    {
+                        **updates,
+                        **cumulative,
+                        "stage_status": status,
+                    },
+                )
+                self._write_cv_aggregate_telemetry(experiment_id)
+            else:
+                self._update_manifest(experiment_id, updates)
+            assert exceptional_failure is not None
+            raise exceptional_failure
+
         runtime = build_runtime_record(
             stage=spec.stage,
             started_at=result.started_at,
@@ -685,8 +1517,16 @@ class NNUNetV2Backend(SegmentationBackend):
             number_of_epochs=number_of_epochs,
             epoch_durations_seconds=epoch_durations or (),
         )
-        runtime_name = "runtime.json" if spec.stage == "train" else f"runtime_{spec.stage}.json"
-        write_json_atomic(experiment_dir / runtime_name, runtime.to_dict())
+        runtime_name = (
+            "runtime.json"
+            if fold_scoped or spec.stage == "train"
+            else f"runtime_{spec.stage}.json"
+        )
+        runtime_path = artifact_dir / runtime_name
+        runtime_payload = runtime.to_dict()
+        runtime_payload["epoch_durations_seconds"] = list(epoch_durations or ())
+        runtime_payload["epochs_observed_this_attempt"] = len(epoch_durations or ())
+        write_json_atomic(runtime_path, runtime_payload)
         stage_aliases: dict[str, Any] = {}
         if spec.stage == "train":
             stage_aliases = {
@@ -712,19 +1552,54 @@ class NNUNetV2Backend(SegmentationBackend):
                         "mean_gpu_utilization": gpu_summary.get("mean_gpu_utilization_percent"),
                     }
                 )
-        self._update_manifest(
-            experiment_id,
-            {
-                "command": format_command(command.argv),
-                "nnUNet_n_proc_DA": workers,
-                f"{spec.stage}_start": result.started_at,
-                f"{spec.stage}_end": result.ended_at,
-                f"{spec.stage}_seconds": result.elapsed_seconds,
-                "stage_status": "FAILED" if failure else "DONE",
-                **stage_aliases,
-                **telemetry_updates,
-            },
-        )
+        execution_updates: dict[str, Any] = {
+            "nnUNet_n_proc_DA": workers,
+            f"{spec.stage}_start": result.started_at,
+            f"{spec.stage}_end": result.ended_at,
+            f"{spec.stage}_seconds": result.elapsed_seconds,
+            "stage_status": "FAILED" if failure else "DONE",
+            "returncode": result.returncode,
+            "log_file": str(log_path),
+            "runtime_file": str(runtime_path),
+            **stage_aliases,
+            **telemetry_updates,
+        }
+        if telemetry_csv_path is not None:
+            execution_updates["gpu_telemetry_csv"] = str(telemetry_csv_path)
+        self._update_manifest(experiment_id, {"command": format_command(command.argv)})
+        if fold_scoped:
+            assert attempt_number is not None
+            attempt_status = "FAILED" if failure else "DONE"
+            self._update_fold_attempt(
+                experiment_id,
+                fold,
+                attempt_number,
+                {
+                    **execution_updates,
+                    "status": attempt_status,
+                    "resume": resume_attempt,
+                    "runtime_file": str(runtime_path),
+                    "gpu_summary_file": (
+                        str(gpu_summary_path) if gpu_summary_path is not None else None
+                    ),
+                },
+            )
+            cumulative = self._aggregate_fold_attempt_artifacts(experiment_id, fold)
+            cumulative_runtime_path = cumulative.get("runtime_file")
+            if isinstance(cumulative_runtime_path, str):
+                cumulative_runtime = load_json(Path(cumulative_runtime_path))
+                execution_updates["training_seconds"] = cumulative_runtime.get("total_seconds")
+                execution_updates["average_epoch_seconds"] = cumulative_runtime.get(
+                    "average_seconds_per_epoch"
+                )
+            self._update_fold_run(
+                experiment_id,
+                fold,
+                {**execution_updates, **cumulative},
+            )
+            self._write_cv_aggregate_telemetry(experiment_id)
+        else:
+            self._update_manifest(experiment_id, execution_updates)
         if failure:
             raise failure
         return result
@@ -807,9 +1682,15 @@ class NNUNetV2Backend(SegmentationBackend):
                     f"{stage_summaries[stage]} and {summary_path}"
                 )
             stage_summaries[stage] = summary_path
-        if not stage_summaries:
+        fold_summaries: dict[int, Path] = {}
+        for fold in range(5):
+            candidate = experiment_dir / "folds" / f"fold_{fold}" / "gpu_summary.json"
+            if candidate.is_file():
+                fold_summaries[fold] = candidate
+        if not stage_summaries and not fold_summaries:
             raise FileNotFoundError(
-                f"No gpu_summary.json or <stage>_gpu_summary.json found in {experiment_dir}"
+                "No root stage GPU summary or fold-scoped gpu_summary.json found in "
+                f"{experiment_dir}"
             )
 
         updates: dict[str, Any] = {}
@@ -832,6 +1713,20 @@ class NNUNetV2Backend(SegmentationBackend):
                     }
                 )
 
+        fold_updates: dict[str, Any] = {}
+        for fold, summary_path in fold_summaries.items():
+            resolved = summary_path.resolve()
+            peak_vram_mb, mean_gpu_utilization = self._validated_gpu_metrics(resolved)
+            values = {
+                "train_peak_vram_mb": peak_vram_mb,
+                "train_mean_gpu_utilization": mean_gpu_utilization,
+                "train_gpu_telemetry_file": str(resolved),
+            }
+            self._update_fold_run(experiment_id, fold, values)
+            fold_updates[str(fold)] = values
+        if fold_updates:
+            updates["fold_gpu_telemetry"] = fold_updates
+            self._write_cv_aggregate_telemetry(experiment_id)
         self._update_manifest(experiment_id, updates)
         return updates
 
@@ -894,7 +1789,7 @@ class NNUNetV2Backend(SegmentationBackend):
             experiment_id,
             kind="benchmark",
             fold=0,
-            trainer="nnUNetTrainerBenchmark_5epochs",
+            trainer=None,
         )
         self._assert_preprocessing_available(identifier)
         benchmark_path = self._benchmark_result_path()
@@ -947,14 +1842,14 @@ class NNUNetV2Backend(SegmentationBackend):
                 "dataset_name": self.dataset_name,
                 "configuration": self.configuration,
                 "fold": 0,
-                "trainer": "nnUNetTrainerBenchmark_5epochs",
+                "trainer": BENCHMARK_TRAINER,
                 "gpu_telemetry_file": str(gpu_summary_path),
                 "gpu_samples": gpu_summary.get("samples"),
             }
         )
         write_json_atomic(self._experiment_dir(identifier) / "benchmark_summary.json", summary)
         self._snapshot_reproducibility(identifier)
-        self._update_manifest(identifier, summary)
+        self._record_benchmark_manifest(identifier, summary)
         if summary.get("recommended_preliminary_trainer") not in PRELIMINARY_TRAINERS:
             raise RuntimeError(
                 "Official benchmark did not produce a finite epoch time; inspect "
@@ -976,23 +1871,34 @@ class NNUNetV2Backend(SegmentationBackend):
         config_path: Path | None = None,
         allow_low_gpu_utilization: bool = False,
     ) -> LiveCommandResult:
-        if trainer not in PRELIMINARY_TRAINERS and trainer != "nnUNetTrainer":
+        if trainer not in SUPPORTED_TRAINERS:
             raise ValueError(
-                "Baseline training only accepts the official default trainer or official "
-                "20/50-epoch validation trainers. Custom trainers require a separately "
-                "documented custom experiment."
+                "Training accepts only the official default nnUNetTrainer and the official "
+                "20/50/100-epoch length variants. Custom trainers require a separately "
+                "implemented and documented custom experiment."
             )
-        kind = "fullcv" if trainer == "nnUNetTrainer" else "prelim"
+        if trainer in STANDARD_CV_TRAINERS:
+            kind = "fullcv"
+            classification = "standard_reference_baseline"
+        elif trainer in COMPUTE_LIMITED_CV_TRAINERS:
+            kind = "fullcv"
+            classification = "compute_limited_cross_validation"
+        else:
+            kind = "prelim"
+            classification = "preliminary_single_fold_baseline"
+        fold_scoped = trainer in CV_TRAINERS
         identifier = self.initialize_experiment(
             experiment_id, kind=kind, fold=fold, trainer=trainer
         )
+        self._assert_experiment_compatible(identifier, trainer)
         self._update_manifest(
             identifier,
             {
                 "experiment_kind": kind,
-                "baseline_classification": "standard_reference_baseline",
-                "fold": fold,
+                "baseline_classification": classification,
                 "trainer": trainer,
+                "save_probabilities": True,
+                **({"folds": [0, 1, 2, 3, 4]} if fold_scoped else {"fold": fold}),
             },
         )
         readiness = self.check_readiness(
@@ -1002,7 +1908,11 @@ class NNUNetV2Backend(SegmentationBackend):
             continue_training=continue_training,
             allow_low_gpu_utilization=allow_low_gpu_utilization,
         )
-        readiness_path = self._experiment_dir(identifier) / "readiness.json"
+        readiness_path = (
+            self._fold_report_dir(identifier, fold) / "readiness.json"
+            if fold_scoped
+            else self._experiment_dir(identifier) / "readiness.json"
+        )
         write_json_atomic(readiness_path, readiness.to_dict())
         self.print_readiness(readiness)
         if not readiness.ready:
@@ -1011,39 +1921,59 @@ class NNUNetV2Backend(SegmentationBackend):
             )
 
         environment = collect_system_report(self.paths)
-        self._update_manifest(
-            identifier,
-            {
-                "dataset_path": str(self.dataset_raw_dir),
-                "dataset_case_count": readiness.details.get("dataset_case_count"),
-                "GPU": environment.get("gpu_name"),
-                "gpu_vram_mb": environment.get("gpu_vram_mb"),
-                "torch": environment.get("torch"),
-                "cuda": environment.get("cuda"),
-                "cudnn": environment.get("cudnn"),
-                "python": environment.get("python"),
-                "nnUNet_version": environment.get("nnUNet_version"),
-                "git_commit": environment.get("project_git_commit"),
-                "upstream_commit": environment.get("upstream", {}).get("commit"),
-                "patch_size": readiness.details.get("patch_size"),
-                "batch_size": readiness.details.get("batch_size"),
-                "target_spacing": readiness.details.get("target_spacing"),
-                "architecture": readiness.details.get("architecture"),
-                "split": {
-                    "source": str(self.dataset_preprocessed_dir / "splits_final.json"),
+        common_provenance = {
+            "dataset_path": str(self.dataset_raw_dir),
+            "dataset_case_count": readiness.details.get("dataset_case_count"),
+            "GPU": environment.get("gpu_name"),
+            "gpu_vram_mb": environment.get("gpu_vram_mb"),
+            "torch": environment.get("torch"),
+            "cuda": environment.get("cuda"),
+            "cudnn": environment.get("cudnn"),
+            "python": environment.get("python"),
+            "nnUNet_version": environment.get("nnUNet_version"),
+            "git_commit": environment.get("project_git_commit"),
+            "upstream_commit": environment.get("upstream", {}).get("commit"),
+            "patch_size": readiness.details.get("patch_size"),
+            "batch_size": readiness.details.get("batch_size"),
+            "target_spacing": readiness.details.get("target_spacing"),
+            "architecture": readiness.details.get("architecture"),
+        }
+        split_provenance = {
+            "source": str(self.dataset_preprocessed_dir / "splits_final.json"),
+            "fold": fold,
+            "train_cases": readiness.details.get("fold_train_cases"),
+            "validation_cases": readiness.details.get("fold_val_cases"),
+        }
+        self._update_manifest(identifier, common_provenance)
+        if fold_scoped:
+            self._update_fold_run(
+                identifier,
+                fold,
+                {
                     "fold": fold,
-                    "train_cases": readiness.details.get("fold_train_cases"),
-                    "validation_cases": readiness.details.get("fold_val_cases"),
+                    "trainer": trainer,
+                    "epochs": SUPPORTED_TRAINERS[trainer],
+                    "readiness_file": str(readiness_path),
+                    "readiness": "READY",
+                    "split": split_provenance,
                 },
-            },
-        )
+            )
+        else:
+            self._update_manifest(identifier, {"split": split_provenance})
 
-        epochs = PRELIMINARY_TRAINERS.get(trainer, 1000)
+        epochs = SUPPORTED_TRAINERS[trainer]
         self._snapshot_reproducibility(identifier, config_path)
         owner_path = self._model_owner_path(trainer, fold)
         owner_path.parent.mkdir(parents=True, exist_ok=True)
         write_json_atomic(owner_path, self._model_owner(identifier, trainer, fold))
-        self._update_manifest(identifier, {"trainer_output_owner": str(owner_path)})
+        if fold_scoped:
+            self._update_fold_run(
+                identifier,
+                fold,
+                {"trainer_output_owner": str(owner_path)},
+            )
+        else:
+            self._update_manifest(identifier, {"trainer_output_owner": str(owner_path)})
         result = self._execute(
             build_train(
                 self.dataset_id,
@@ -1059,45 +1989,93 @@ class NNUNetV2Backend(SegmentationBackend):
             trainer=trainer,
             monitor_gpu=True,
             number_of_epochs=epochs,
+            fold_scoped=fold_scoped,
+            expected_validation_cases=readiness.details.get("fold_val_cases"),
+            resume_attempt=continue_training,
         )
         output_folder = self._model_output_folder(trainer) / f"fold_{fold}"
         checkpoints = [str(path) for path in sorted(output_folder.glob("checkpoint_*.pth"))]
-        self._update_manifest(
-            identifier,
-            {
-                "epochs": epochs,
-                "checkpoint_paths": checkpoints,
-                "trainer_output": str(output_folder),
-                "resume": continue_training,
-            },
-        )
+        completion_updates = {
+            "epochs": epochs,
+            "checkpoint_paths": checkpoints,
+            "trainer_output": str(output_folder),
+            "resume": continue_training,
+        }
+        if fold_scoped:
+            self._update_fold_run(identifier, fold, completion_updates)
+            audit = self.audit_fold_artifacts(
+                experiment_id=identifier,
+                trainer=trainer,
+                fold=fold,
+                require_probabilities=True,
+                record=True,
+            )
+            self._write_cv_aggregate_telemetry(identifier)
+            if not audit["complete"]:
+                raise RuntimeError(
+                    "Official training command returned successfully, but strict fold artifact "
+                    f"audit failed for fold {fold}: {audit['checks']}"
+                )
+        else:
+            self._update_manifest(identifier, completion_updates)
         return result
 
     def accumulate_cross_validation(
         self,
         *,
         output_dir: Path,
+        trainer: str = "nnUNetTrainer",
         experiment_id: str | None = None,
     ) -> LiveCommandResult:
-        """Accumulate official default-trainer validation predictions for all five folds."""
+        """Accumulate one trainer's strictly audited validation predictions."""
+
+        if trainer not in CV_TRAINERS:
+            raise ValueError(
+                "Cross-validation accumulation accepts nnUNetTrainer or "
+                "nnUNetTrainer_100epochs"
+            )
+        kind = "fullcv"
 
         identifier = self.initialize_experiment(
             experiment_id,
-            kind="fullcv",
+            kind=kind,
             fold=0,
-            trainer="nnUNetTrainer",
+            trainer=trainer,
         )
-        model_folder = self._model_output_folder("nnUNetTrainer")
-        missing = [
-            model_folder / f"fold_{fold}" / "validation"
-            for fold in range(5)
-            if not (model_folder / f"fold_{fold}" / "validation").is_dir()
-        ]
-        if missing:
-            raise FileNotFoundError(
-                "Cannot accumulate CV; validation folder(s) missing: "
-                + ", ".join(str(path) for path in missing)
+        self._assert_experiment_compatible(identifier, trainer)
+        self._update_manifest(
+            identifier,
+            {
+                "experiment_kind": "fullcv",
+                "baseline_classification": (
+                    "compute_limited_cross_validation"
+                    if trainer in COMPUTE_LIMITED_CV_TRAINERS
+                    else "standard_reference_baseline"
+                ),
+                "trainer": trainer,
+                "folds": [0, 1, 2, 3, 4],
+                "save_probabilities": True,
+            },
+        )
+        fold_audits = [
+            self.audit_fold_artifacts(
+                experiment_id=identifier,
+                trainer=trainer,
+                fold=fold,
+                require_probabilities=True,
+                record=True,
             )
+            for fold in range(5)
+        ]
+        incomplete = [audit for audit in fold_audits if not audit["complete"]]
+        if incomplete:
+            failed = {
+                str(audit["fold"]): [
+                    check["name"] for check in audit["checks"] if not check["ok"]
+                ]
+                for audit in incomplete
+            }
+            raise RuntimeError(f"Cannot accumulate incomplete or foreign fold artifacts: {failed}")
         if output_dir.exists() and any(output_dir.iterdir()):
             raise FileExistsError(
                 f"Refusing to overwrite non-empty accumulated CV output: {output_dir}"
@@ -1108,15 +2086,55 @@ class NNUNetV2Backend(SegmentationBackend):
                 self.dataset_id,
                 self.configuration,
                 output_dir,
-                trainer="nnUNetTrainer",
+                trainer=trainer,
                 plans=self.plans_name,
             ),
             experiment_id=identifier,
             fold=0,
-            trainer="nnUNetTrainer",
+            trainer=trainer,
             monitor_gpu=False,
         )
-        self._update_manifest(identifier, {"crossval_predictions": str(output_dir.resolve())})
+        expected_ids = set().union(
+            *(self._expected_validation_ids(fold) for fold in range(5))
+        )
+        actual_ids, empty_predictions = self._case_ids_with_suffix(output_dir, ".nii.gz")
+        summary_path = output_dir / "summary.json"
+        required_metadata = [output_dir / "dataset.json", output_dir / "plans.json", summary_path]
+        postcondition_ok = (
+            actual_ids == expected_ids
+            and not empty_predictions
+            and all(path.is_file() and path.stat().st_size > 0 for path in required_metadata)
+        )
+        crossval_audit = {
+            "complete": postcondition_ok,
+            "valid": postcondition_ok,
+            "trainer": trainer,
+            "folds": [0, 1, 2, 3, 4],
+            "expected_cases": len(expected_ids),
+            "actual_cases": len(actual_ids),
+            "missing": sorted(expected_ids - actual_ids),
+            "extra": sorted(actual_ids - expected_ids),
+            "empty_predictions": empty_predictions,
+            "summary_file": str(summary_path),
+            "output_dir": str(output_dir.resolve()),
+        }
+        write_json_atomic(
+            self._experiment_dir(identifier) / "crossval_artifact_audit.json",
+            crossval_audit,
+        )
+        self._update_manifest(
+            identifier,
+            {
+                "crossval_predictions": str(output_dir.resolve()),
+                "crossval_artifact_audit": crossval_audit,
+            },
+        )
+        self._write_cv_aggregate_telemetry(identifier)
+        if not postcondition_ok:
+            raise RuntimeError(
+                "Official cross-validation accumulation returned successfully, but its strict "
+                f"postcondition failed: {crossval_audit}"
+            )
         return result
 
     def predict(
@@ -1205,9 +2223,17 @@ class NNUNetV2Backend(SegmentationBackend):
         experiment_dir = self._experiment_dir(experiment_id)
         manifest_path = experiment_dir / "experiment.json"
         manifest = load_json(manifest_path)
+        checkpoint_paths = list(manifest.get("checkpoint_paths", []))
+        fold_runs = manifest.get("fold_runs", {})
+        if isinstance(fold_runs, Mapping):
+            for fold_record in fold_runs.values():
+                if isinstance(fold_record, Mapping):
+                    checkpoint_paths.extend(fold_record.get("checkpoint_paths", []))
         return BackendArtifacts(
             experiment_id=experiment_id,
-            checkpoint_paths=tuple(Path(path) for path in manifest.get("checkpoint_paths", [])),
+            checkpoint_paths=tuple(
+                Path(path) for path in dict.fromkeys(str(path) for path in checkpoint_paths)
+            ),
             prediction_dir=(
                 Path(manifest["prediction_dir"]) if manifest.get("prediction_dir") else None
             ),
@@ -1728,6 +2754,20 @@ def _build_parser() -> argparse.ArgumentParser:
     accumulate = subparsers.add_parser("accumulate-crossval")
     accumulate.add_argument("--experiment-id", default=None)
     accumulate.add_argument("--output-dir", type=Path, required=True)
+    accumulate.add_argument("--trainer", required=True)
+
+    audit_fold = subparsers.add_parser("audit-fold")
+    audit_fold.add_argument("--experiment-id", required=True)
+    audit_fold.add_argument("--fold", type=int, required=True)
+    audit_fold.add_argument("--trainer", required=True)
+    audit_fold.add_argument("--require-probabilities", action="store_true")
+    audit_fold.add_argument("--output", type=Path, default=None)
+
+    archive_restart = subparsers.add_parser("archive-restart-fold")
+    archive_restart.add_argument("--experiment-id", required=True)
+    archive_restart.add_argument("--fold", type=int, required=True)
+    archive_restart.add_argument("--trainer", required=True)
+    archive_restart.add_argument("--output", type=Path, default=None)
 
     record = subparsers.add_parser("record-artifacts")
     record.add_argument("--experiment-id", required=True)
@@ -1796,8 +2836,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.action == "accumulate-crossval":
         backend.accumulate_cross_validation(
             output_dir=args.output_dir.resolve(),
+            trainer=args.trainer,
             experiment_id=args.experiment_id,
         )
+    elif args.action == "audit-fold":
+        audit = backend.audit_fold_artifacts(
+            experiment_id=args.experiment_id,
+            trainer=args.trainer,
+            fold=args.fold,
+            require_probabilities=args.require_probabilities,
+            record=True,
+        )
+        if args.output:
+            write_json_atomic(args.output.resolve(), audit)
+        print(json.dumps(audit, indent=2, ensure_ascii=False))
+        return 0 if audit["complete"] else 2
+    elif args.action == "archive-restart-fold":
+        archive = backend.archive_restartable_fold(
+            experiment_id=args.experiment_id,
+            trainer=args.trainer,
+            fold=args.fold,
+        )
+        if args.output:
+            write_json_atomic(args.output.resolve(), archive)
+        print(json.dumps(archive, indent=2, ensure_ascii=False))
     elif args.action == "record-artifacts":
         artifacts: dict[str, Path] = {}
         for item in args.artifact:

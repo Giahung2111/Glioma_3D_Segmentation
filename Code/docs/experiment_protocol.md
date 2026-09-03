@@ -30,6 +30,12 @@ protocol, folds 0–4, and saved probabilities. Results from preliminary shorten
 training must not be compared directly to challenge leaderboard results as if the
 protocols were equal.
 
+The intermediate five-fold run configured in `nnunet_100epoch_cv.yaml` uses the
+unmodified official upstream `nnUNetTrainer_100epochs` and saved probabilities. It
+provides complete out-of-fold evidence under the available compute budget, but its
+manifest and reports must say `compute_limited_cross_validation`; it does not replace
+or impersonate the default 1000-epoch reference.
+
 Baseline one excludes pretrained weights, external data, synthetic data, GANs, custom
 postprocessing, ensembles, registration augmentation, custom loss/architecture, and
 unrequested normalization or image preprocessing. BraTS already provides registration,

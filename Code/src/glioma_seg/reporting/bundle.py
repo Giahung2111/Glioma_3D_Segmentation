@@ -98,6 +98,145 @@ def _load_json_object(path: Path, *, description: str) -> dict[str, Any]:
     return value
 
 
+def _load_utf8_text(path: Path, *, description: str) -> str:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ReportBundleError(f"{description} is missing or empty: {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ReportBundleError(f"{description} is not valid UTF-8: {path}: {exc}") from exc
+    if not text.strip():
+        raise ReportBundleError(f"{description} contains no report content: {path}")
+    return text
+
+
+def _validate_fullcv_markdown(experiment_dir: Path) -> str:
+    """Reject a complete artifact bundle whose narrative silently says single-fold."""
+
+    summary = _load_utf8_text(
+        experiment_dir / "summary.md", description="full-CV summary Markdown"
+    )
+    weekly = _load_utf8_text(
+        experiment_dir / "weekly_discussion.md",
+        description="full-CV weekly-discussion Markdown",
+    )
+    required_summary = (
+        "5-Fold nnU-Net v2 Cross-Validation",
+        "| Fold(s) | 0, 1, 2, 3, 4 |",
+        "all 1,251 cases appear in validation exactly once (verified)",
+        "retained for every out-of-fold case",
+        "### Per-fold semantic metrics",
+        "Cross-Validation Failure Analysis",
+    )
+    required_weekly = (
+        "5-Fold BraTS 2023 GLI Cross-Validation",
+        "- Fold(s): 0, 1, 2, 3, 4",
+        "### Pooled out-of-fold metrics",
+    )
+    missing = [marker for marker in required_summary if marker not in summary]
+    missing += [marker for marker in required_weekly if marker not in weekly]
+    if missing:
+        raise ReportBundleError(
+            "Full-CV Markdown is inconsistent with the verified five-fold artifacts; "
+            f"missing markers: {missing}"
+        )
+    forbidden = ("preliminary single-fold", "not a completed five-fold")
+    present_forbidden = [
+        marker
+        for marker in forbidden
+        if marker in summary.casefold() or marker in weekly.casefold()
+    ]
+    if present_forbidden:
+        raise ReportBundleError(
+            "Full-CV Markdown contains stale preliminary/single-fold claims: "
+            f"{present_forbidden}"
+        )
+    if "not generated" in summary.casefold():
+        raise ReportBundleError(
+            "Full-CV Markdown claims that one or more required failure figures were not generated"
+        )
+    return summary
+
+
+def _validate_fullcv_figures(experiment_dir: Path, summary: str) -> None:
+    """Require portable manifest paths, existing PNGs, and summary links."""
+
+    figures_dir = (experiment_dir / "figures").resolve()
+    manifest_path = figures_dir / "figures_manifest.csv"
+    try:
+        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ReportBundleError(f"Figure manifest is unreadable: {manifest_path}: {exc}") from exc
+    if not rows:
+        raise ReportBundleError(f"Figure manifest contains no figures: {manifest_path}")
+    failure_cases_path = experiment_dir / "failure_cases.csv"
+    try:
+        with failure_cases_path.open("r", encoding="utf-8", newline="") as handle:
+            failure_case_rows = list(csv.DictReader(handle))
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ReportBundleError(
+            f"Failure-case inventory is unreadable: {failure_cases_path}: {exc}"
+        ) from exc
+    expected_cases = {
+        str(row.get("case_id", "")).strip()
+        for row in failure_case_rows
+        if str(row.get("case_id", "")).strip()
+    }
+    if not expected_cases:
+        raise ReportBundleError(f"Failure-case inventory contains no cases: {failure_cases_path}")
+    seen_cases: set[str] = set()
+    seen_paths: set[str] = set()
+    for row in rows:
+        case_id = str(row.get("case_id", "")).strip()
+        recorded_path = str(row.get("figure_path", "")).strip()
+        orientation = str(row.get("orientation_convention", "")).strip()
+        if not case_id or case_id in seen_cases:
+            raise ReportBundleError(f"Figure manifest has a missing/duplicate case ID: {case_id!r}")
+        seen_cases.add(case_id)
+        relative = Path(recorded_path)
+        if not recorded_path or relative.is_absolute():
+            raise ReportBundleError(
+                "Figure manifest path must be portable and relative for "
+                f"{case_id}: {recorded_path!r}"
+            )
+        candidate = (figures_dir / relative).resolve()
+        try:
+            candidate.relative_to(figures_dir)
+        except ValueError as exc:
+            raise ReportBundleError(
+                f"Figure manifest path escapes the report figures directory: {recorded_path!r}"
+            ) from exc
+        normalized_path = str(candidate).casefold()
+        if normalized_path in seen_paths:
+            raise ReportBundleError(f"Figure manifest repeats a PNG path: {candidate}")
+        seen_paths.add(normalized_path)
+        if (
+            not candidate.is_file()
+            or candidate.stat().st_size == 0
+            or candidate.suffix.lower() != ".png"
+        ):
+            raise ReportBundleError(
+                f"Figure manifest references a missing/invalid PNG: {candidate}"
+            )
+        if orientation != "RAS canonical axial; anterior/face up; neurological L/R":
+            raise ReportBundleError(
+                f"Figure manifest has unverified orientation for {case_id}: {orientation!r}"
+            )
+        report_link = (Path("figures") / relative).as_posix()
+        if report_link not in summary:
+            raise ReportBundleError(
+                f"Full-CV summary does not link its generated figure for {case_id}: {report_link}"
+            )
+    if seen_cases != expected_cases:
+        raise ReportBundleError(
+            "Figure manifest case IDs do not match failure_cases.csv: "
+            f"missing={sorted(expected_cases - seen_cases)}, "
+            f"extra={sorted(seen_cases - expected_cases)}"
+        )
+
+
 def _validate_validation_pair(json_path: Path, csv_path: Path, *, dataset_kind: str) -> None:
     payload = _load_json_object(json_path, description=f"{dataset_kind} validation manifest")
     if payload.get("valid") is not True:
@@ -302,7 +441,18 @@ def materialize_official_aliases(experiment_dir: Path) -> tuple[MaterializedArti
 
 def _log_sort_key(path: Path, experiment_dir: Path) -> tuple[int, str]:
     relative = path.relative_to(experiment_dir).as_posix()
-    return (_KNOWN_LOG_ORDER.get(path.name, 100), relative.casefold())
+    priority = _KNOWN_LOG_ORDER.get(path.name)
+    if priority is None:
+        fold_training = re.fullmatch(r"train_fold_([0-4])\.log", path.name)
+        if fold_training is not None:
+            priority = 30 + int(fold_training.group(1))
+        elif path.name == "accumulate_crossval.log":
+            priority = 40
+        elif path.name == "predict.log":
+            priority = 50
+        else:
+            priority = 100
+    return (priority, relative.casefold())
 
 
 def create_pipeline_log(experiment_dir: Path) -> tuple[Path, tuple[Mapping[str, Any], ...]]:
@@ -407,16 +557,111 @@ def _record_final_artifacts(
         friendly_key = _FRIENDLY_ARTIFACT_KEYS.get(relative)
         if friendly_key is not None:
             friendly[friendly_key] = str(resolved)
-    required_final = (
+    required_final: tuple[str, ...] = (
         "summary.md",
         "weekly_discussion.md",
         "metrics_summary.csv",
         "pipeline.log",
         *TRAINING_VALIDATION_FILES,
     )
+    if manifest.get("experiment_kind") == "fullcv":
+        required_final += (
+            "crossval_summary.json",
+            "crossval_integrity.json",
+            "crossval_metrics_by_fold.csv",
+            "metrics_per_case.csv",
+            "evaluation_protocol.json",
+            "runtime.json",
+            "inference_runtime.json",
+            "gpu_summary.json",
+            "fold_training_summary.csv",
+            "official_brats_metrics_status.json",
+            "official_lesionwise_metrics_summary.csv",
+            "official_lesionwise_metrics_summary.json",
+            "official_lesionwise_metrics_per_case.csv",
+            "failure_rankings.csv",
+            "failure_cases.csv",
+            "figures/figures_manifest.csv",
+            *(f"logs/train_fold_{fold}.log" for fold in range(5)),
+            *(f"folds/fold_{fold}/readiness.json" for fold in range(5)),
+            *(f"folds/fold_{fold}/runtime.json" for fold in range(5)),
+            *(f"folds/fold_{fold}/gpu_summary.json" for fold in range(5)),
+            *(f"folds/fold_{fold}/artifact_audit.json" for fold in range(5)),
+        )
     missing = [name for name in required_final if name not in inventory]
     if missing:
         raise ReportBundleError(f"Required final report artifacts are missing: {missing}")
+    if manifest.get("experiment_kind") == "fullcv":
+        crossval = _load_json_object(
+            experiment_dir / "crossval_summary.json",
+            description="full-CV summary",
+        )
+        if (
+            crossval.get("valid") is not True
+            or crossval.get("folds") != [0, 1, 2, 3, 4]
+            or crossval.get("total_cases") != 1251
+            or crossval.get("each_case_validated_once") is not True
+            or crossval.get("probabilities_retained") is not True
+            or crossval.get("probability_source_channel_order") != ["WT", "TC", "ET"]
+            or crossval.get("probability_canonical_order") != ["ET", "TC", "WT"]
+        ):
+            raise ReportBundleError(
+                "Full-CV report cannot be finalized without a verified 1,251-case "
+                "five-fold out-of-fold summary"
+            )
+        training_validation = _load_json_object(
+            experiment_dir / "data_validation.json",
+            description="full-CV training-data validation",
+        )
+        if training_validation.get("actual_case_count") != 1251:
+            raise ReportBundleError(
+                "Full-CV report requires the verified 1,251-case training dataset"
+            )
+        for fold, expected_cases in enumerate((251, 250, 250, 250, 250)):
+            audit = _load_json_object(
+                experiment_dir / "folds" / f"fold_{fold}" / "artifact_audit.json",
+                description=f"fold {fold} final artifact audit",
+            )
+            if (
+                audit.get("complete") is not True
+                or audit.get("valid") is not True
+                or audit.get("expected_validation_cases") != expected_cases
+                or audit.get("validation_case_count") != expected_cases
+            ):
+                raise ReportBundleError(
+                    f"Full-CV report cannot be finalized because fold {fold} did not pass "
+                    "its exact checkpoint/mask/NPZ/PKL audit"
+                )
+        inference = _load_json_object(
+            experiment_dir / "inference_runtime.json",
+            description="five-model inference timing",
+        )
+        if (
+            inference.get("folds") != [0, 1, 2, 3, 4]
+            or inference.get("tta_state") != "OFF"
+            or inference.get("number_of_cases") != 10
+            or inference.get("timing_comparable") is not True
+        ):
+            raise ReportBundleError(
+                "Full-CV report requires an audited fresh 10-case, five-model, TTA-off "
+                "inference timing run"
+            )
+        official_status = _load_json_object(
+            experiment_dir / "official_brats_metrics_status.json",
+            description="official full-CV metric status",
+        )
+        if (
+            official_status.get("available") is not True
+            or official_status.get("case_count") != 1251
+            or official_status.get("version_or_commit")
+            != "43c905242b2eecf421d4ab2da7af8ece9777d322"
+        ):
+            raise ReportBundleError(
+                "Full-CV report cannot be finalized without successful pinned official "
+                "lesion-wise metrics for all 1,251 out-of-fold cases"
+            )
+        fullcv_summary = _validate_fullcv_markdown(experiment_dir)
+        _validate_fullcv_figures(experiment_dir, fullcv_summary)
     manifest["artifacts"] = friendly
     manifest["final_artifacts"] = inventory
     manifest["report_bundle"] = {

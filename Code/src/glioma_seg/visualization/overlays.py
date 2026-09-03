@@ -64,7 +64,8 @@ def overlay_labels(
 
 
 def _take(volume: NDArray[Any], index: int, axis: int) -> NDArray[Any]:
-    # Transpose for a stable radiological-review-friendly display orientation.
+    # NIfTI inputs are canonicalized to RAS before slicing. For axial RAS,
+    # this puts anterior at the top and uses neurological left/right display.
     return np.rot90(np.take(volume, index, axis=axis))
 
 
@@ -149,6 +150,23 @@ def create_failure_figure(
                     f"{modality_name} · {label_name} · axis {normalized_axis}, slice {slice_index}",
                     fontsize=9,
                 )
+                if normalized_axis == 2:
+                    for x, y, text, horizontal, vertical in (
+                        (0.5, 0.99, "A", "center", "top"),
+                        (0.5, 0.01, "P", "center", "bottom"),
+                        (0.01, 0.5, "L", "left", "center"),
+                        (0.99, 0.5, "R", "right", "center"),
+                    ):
+                        axis_object.text(
+                            x,
+                            y,
+                            text,
+                            color="white",
+                            fontsize=7,
+                            ha=horizontal,
+                            va=vertical,
+                            transform=axis_object.transAxes,
+                        )
                 axis_object.axis("off")
 
     legend = [
@@ -156,7 +174,12 @@ def create_failure_figure(
         for label in (1, 2, 3)
     ]
     figure.legend(handles=legend, loc="lower center", ncol=3, frameon=False)
-    figure.suptitle(f"{case_id}\n{_format_metrics(metrics)}", fontsize=11)
+    orientation = (
+        "RAS canonical axial; anterior/face up; neurological L/R"
+        if normalized_axis == 2
+        else f"RAS canonical display; axis {normalized_axis}"
+    )
+    figure.suptitle(f"{case_id}\n{_format_metrics(metrics)}\n{orientation}", fontsize=11)
     figure.tight_layout(rect=(0.0, 0.035, 1.0, 0.96))
     destination = Path(output_path)
     if destination.suffix.lower() != ".png":
@@ -188,14 +211,36 @@ def create_failure_figure_from_nifti(
 
     paths = [Path(t1c_path), Path(flair_path), Path(ground_truth_path), Path(prediction_path)]
     images: list[Any] = [nib.load(str(path)) for path in paths]
-    arrays = [np.asanyarray(image.dataobj) for image in images]
-    reference_shape = arrays[0].shape
+    reference_shape = images[0].shape
     reference_affine = np.asarray(images[0].affine)
-    for path, image, array in zip(paths[1:], images[1:], arrays[1:], strict=False):
-        if array.shape != reference_shape:
-            raise ValueError(f"NIfTI shape mismatch at {path}: {array.shape} vs {reference_shape}")
+    for path, image in zip(paths[1:], images[1:], strict=False):
+        if image.shape != reference_shape:
+            raise ValueError(
+                f"NIfTI shape mismatch at {path}: {image.shape} vs {reference_shape}"
+            )
         if not np.allclose(image.affine, reference_affine, rtol=0.0, atol=1e-4):
             raise ValueError(f"NIfTI affine mismatch at {path}")
+    # nibabel does not currently expose typing for these orientation helpers.
+    canonical_images = [
+        nib.as_closest_canonical(image)  # type: ignore[no-untyped-call]
+        for image in images
+    ]
+    canonical_shape = canonical_images[0].shape
+    canonical_affine = np.asarray(canonical_images[0].affine)
+    for path, image in zip(paths[1:], canonical_images[1:], strict=False):
+        if image.shape != canonical_shape:
+            raise ValueError(
+                f"Canonical NIfTI shape mismatch at {path}: {image.shape} vs {canonical_shape}"
+            )
+        if not np.allclose(image.affine, canonical_affine, rtol=0.0, atol=1e-4):
+            raise ValueError(f"Canonical NIfTI affine mismatch at {path}")
+    orientation_codes = tuple(
+        str(code)
+        for code in nib.aff2axcodes(canonical_affine)  # type: ignore[no-untyped-call]
+    )
+    if orientation_codes != ("R", "A", "S"):
+        raise ValueError(f"Unable to establish RAS display orientation: {orientation_codes}")
+    arrays = [np.asanyarray(image.dataobj) for image in canonical_images]
     return create_failure_figure(
         case_id=case_id,
         t1c=arrays[0],
@@ -291,15 +336,27 @@ def generate_failure_figures(
         manifest_rows.append(
             {
                 "case_id": case_id,
-                "figure_path": str(figure_path.resolve()),
+                # Keep the manifest portable after its staging directory is
+                # atomically moved into the final report bundle.
+                "figure_path": figure_path.name,
                 "modalities": "T1c;T2-FLAIR",
                 "overlay": "ground_truth;prediction",
+                "orientation_convention": (
+                    "RAS canonical axial; anterior/face up; neurological L/R"
+                ),
             }
         )
     manifest = destination / "figures_manifest.csv"
     with manifest.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
-            handle, fieldnames=["case_id", "figure_path", "modalities", "overlay"]
+            handle,
+            fieldnames=[
+                "case_id",
+                "figure_path",
+                "modalities",
+                "overlay",
+                "orientation_convention",
+            ],
         )
         writer.writeheader()
         writer.writerows(manifest_rows)

@@ -1,0 +1,18 @@
+experiment_kind: fullcv
+backend: segresnet
+protocol_label: 100-epoch compute-limited MONAI SegResNet cross-validation
+model_config: ../models/segresnet_monai_bundle.yaml
+dataset_config: ../datasets/brats2023_gli.yaml
+dataset_id: 501
+dataset_name: Dataset501_BraTS2023GLI
+folds: [0, 1, 2, 3, 4]
+epochs_per_fold: 100
+save_native_probabilities: true
+save_canonical_probabilities: true
+allow_resume: true
+ensemble: false
+external_data: false
+notes: >-
+  This is a 100-epoch compute-limited single SegResNet comparison. It is not
+  the original 300-epoch MONAI bundle recipe and not an Auto3DSeg ensemble.
+

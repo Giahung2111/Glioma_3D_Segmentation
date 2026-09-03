@@ -18,8 +18,7 @@ filelock==3.32.3
 fonttools==4.63.0
 fsspec==2026.7.0
 future==1.0.0
-# Editable local project (glioma-seg==0.1.0)
--e .
+-e git+https://github.com/Giahung2111/Glioma_3D_Segmentation.git@350cc769d8ca1090e6f2144ee2b4e3ac82056800#egg=glioma_seg&subdirectory=code
 graphviz==0.21
 h11==0.16.0
 h2==4.4.1

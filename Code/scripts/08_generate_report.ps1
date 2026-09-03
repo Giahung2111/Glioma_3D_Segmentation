@@ -1,10 +1,19 @@
-param([string]$ExperimentId = '')
+param(
+    [string]$ExperimentId = '',
+    [string]$CrossvalSummaryJson = ''
+)
 
 . (Join-Path $PSScriptRoot '_common.ps1')
 Write-GliomaStage -Number '8/8' -Name 'Report Generation'
 
 if ([string]::IsNullOrWhiteSpace($ExperimentId)) { throw 'ExperimentId is required.' }
 $reportDirectory = Get-GliomaReportDirectory -ExperimentId $ExperimentId
+if (-not [string]::IsNullOrWhiteSpace($CrossvalSummaryJson)) {
+    $CrossvalSummaryJson = [IO.Path]::GetFullPath($CrossvalSummaryJson)
+    if (-not (Test-Path -LiteralPath $CrossvalSummaryJson -PathType Leaf)) {
+        throw "Cross-validation report summary is missing: $CrossvalSummaryJson"
+    }
+}
 $required = @(
     (Join-Path $reportDirectory 'experiment.json'),
     (Join-Path $reportDirectory 'metrics_summary.csv')
@@ -43,6 +52,11 @@ $optionalArguments = @(
 )
 foreach ($pair in $optionalArguments) {
     if (Test-Path -LiteralPath $pair[1]) { $arguments += $pair }
+}
+if (-not [string]::IsNullOrWhiteSpace($CrossvalSummaryJson)) {
+    # Append directly. Wrapping one nested pair in @() causes Windows PowerShell
+    # 5.1 to flatten it into two strings, silently dropping this CLI argument.
+    $arguments += @('--crossval-summary-json', $CrossvalSummaryJson)
 }
 Invoke-GliomaPython -Arguments $arguments
 

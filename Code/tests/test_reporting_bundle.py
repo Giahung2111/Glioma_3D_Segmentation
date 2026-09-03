@@ -198,6 +198,177 @@ def test_finalize_records_every_experiment_local_artifact_with_hashes(tmp_path: 
     )
 
 
+def _make_complete_fullcv_bundle(tmp_path: Path) -> tuple[Path, Path]:
+    reports, experiment = _make_bundle_tree(tmp_path)
+    _write_validation_pair(reports, "", "training", 1251)
+    (experiment / "experiment.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "experiment_a",
+                "experiment_kind": "fullcv",
+                "trainer": "nnUNetTrainer_100epochs",
+            }
+        ),
+        encoding="utf-8",
+    )
+    text_artifacts = {
+        "summary.md": (
+            "# 5-Fold nnU-Net v2 Cross-Validation\n\n"
+            "| Fold(s) | 0, 1, 2, 3, 4 |\n"
+            "all 1,251 cases appear in validation exactly once (verified)\n"
+            "retained for every out-of-fold case\n"
+            "### Per-fold semantic metrics\n"
+            "## Cross-Validation Failure Analysis\n"
+            "[a.png](figures/a.png)\n"
+        ),
+        "weekly_discussion.md": (
+            "# Weekly Discussion - 5-Fold BraTS 2023 GLI Cross-Validation\n"
+            "- Fold(s): 0, 1, 2, 3, 4\n"
+            "### Pooled out-of-fold metrics\n"
+        ),
+        "metrics_summary.csv": "metric,ET,TC,WT\nDice,1,1,1\nHD95,0,0,0\n",
+        "metrics_per_case.csv": "case_id,dice_et\na,1\n",
+        "evaluation_protocol.json": "{}\n",
+        "runtime.json": "{}\n",
+        "gpu_summary.json": "{}\n",
+        "fold_training_summary.csv": "fold,epochs\n0,100\n",
+        "crossval_integrity.json": '{"valid": true}\n',
+        "crossval_metrics_by_fold.csv": "fold,metric,ET,TC,WT\n0,Dice,1,1,1\n",
+        "official_lesionwise_metrics_summary.csv": "metric,ET,TC,WT\nDice,1,1,1\n",
+        "official_lesionwise_metrics_summary.json": '{"case_count": 1251}\n',
+        "official_lesionwise_metrics_per_case.csv": "case_id,dice_et\na,1\n",
+        "failure_rankings.csv": "case_id,rank\na,1\n",
+        "failure_cases.csv": "case_id\na\n",
+    }
+    for name, content in text_artifacts.items():
+        (experiment / name).write_text(content, encoding="utf-8")
+    (experiment / "crossval_summary.json").write_text(
+        json.dumps(
+            {
+                "valid": True,
+                "folds": [0, 1, 2, 3, 4],
+                "total_cases": 1251,
+                "each_case_validated_once": True,
+                "probabilities_retained": True,
+                "probability_source_channel_order": ["WT", "TC", "ET"],
+                "probability_canonical_order": ["ET", "TC", "WT"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (experiment / "inference_runtime.json").write_text(
+        json.dumps(
+            {
+                "folds": [0, 1, 2, 3, 4],
+                "tta_state": "OFF",
+                "number_of_cases": 10,
+                "timing_comparable": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (experiment / "official_brats_metrics_status.json").write_text(
+        json.dumps(
+            {
+                "available": True,
+                "case_count": 1251,
+                "version_or_commit": "43c905242b2eecf421d4ab2da7af8ece9777d322",
+            }
+        ),
+        encoding="utf-8",
+    )
+    figures = experiment / "figures"
+    figures.mkdir()
+    (figures / "figures_manifest.csv").write_text(
+        "case_id,figure_path,orientation_convention\n"
+        "a,a.png,RAS canonical axial; anterior/face up; neurological L/R\n",
+        encoding="utf-8",
+    )
+    (figures / "a.png").write_bytes(b"valid-png-evidence")
+    for fold, expected_cases in enumerate((251, 250, 250, 250, 250)):
+        (experiment / "logs" / f"train_fold_{fold}.log").write_text(
+            f"fold {fold}\n", encoding="utf-8"
+        )
+        fold_dir = experiment / "folds" / f"fold_{fold}"
+        fold_dir.mkdir(parents=True)
+        for name in ("readiness.json", "runtime.json", "gpu_summary.json"):
+            (fold_dir / name).write_text("{}\n", encoding="utf-8")
+        (fold_dir / "artifact_audit.json").write_text(
+            json.dumps(
+                {
+                    "complete": True,
+                    "valid": True,
+                    "expected_validation_cases": expected_cases,
+                    "validation_case_count": expected_cases,
+                }
+            ),
+            encoding="utf-8",
+        )
+    return reports, experiment
+
+
+def test_fullcv_finalize_requires_all_audited_outputs(tmp_path: Path) -> None:
+    reports, experiment = _make_complete_fullcv_bundle(tmp_path)
+
+    result = complete_report_bundle(
+        workspace_reports=reports,
+        experiment_dir=experiment,
+        phase="finalize",
+    )
+
+    assert result.recorded_artifact_count is not None
+    manifest = json.loads((experiment / "experiment.json").read_text(encoding="utf-8"))
+    assert "folds/fold_4/artifact_audit.json" in manifest["final_artifacts"]
+    assert "inference_runtime.json" in manifest["final_artifacts"]
+
+
+def test_fullcv_finalize_rejects_unavailable_official_metrics(tmp_path: Path) -> None:
+    reports, experiment = _make_complete_fullcv_bundle(tmp_path)
+    status_path = experiment / "official_brats_metrics_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["available"] = False
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    with pytest.raises(ReportBundleError, match="successful pinned official"):
+        complete_report_bundle(
+            workspace_reports=reports,
+            experiment_dir=experiment,
+            phase="finalize",
+        )
+
+
+def test_fullcv_finalize_rejects_stale_preliminary_markdown(tmp_path: Path) -> None:
+    reports, experiment = _make_complete_fullcv_bundle(tmp_path)
+    (experiment / "summary.md").write_text(
+        "# Preliminary baseline\nThis is a preliminary single-fold result.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReportBundleError, match="Markdown is inconsistent"):
+        complete_report_bundle(
+            workspace_reports=reports,
+            experiment_dir=experiment,
+            phase="finalize",
+        )
+
+
+def test_fullcv_finalize_rejects_stale_absolute_figure_path(tmp_path: Path) -> None:
+    reports, experiment = _make_complete_fullcv_bundle(tmp_path)
+    stale = tmp_path / "staging" / "a.png"
+    (experiment / "figures" / "figures_manifest.csv").write_text(
+        "case_id,figure_path,orientation_convention\n"
+        f"a,{stale},RAS canonical axial; anterior/face up; neurological L/R\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReportBundleError, match="portable and relative"):
+        complete_report_bundle(
+            workspace_reports=reports,
+            experiment_dir=experiment,
+            phase="finalize",
+        )
+
+
 def test_report_uses_verified_split_validation_and_telemetry_evidence(tmp_path: Path) -> None:
     output = tmp_path / "report"
     output.mkdir()

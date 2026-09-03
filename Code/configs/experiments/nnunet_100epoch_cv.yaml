@@ -1,0 +1,22 @@
+experiment_kind: fullcv
+baseline_classification: compute_limited_cross_validation
+protocol_label: 100-epoch compute-limited nnU-Net cross-validation
+model_config: ../models/nnunetv2_3d_fullres.yaml
+dataset_config: ../datasets/brats2023_gli.yaml
+dataset_id: 501
+dataset_name: Dataset501_BraTS2023GLI
+configuration: 3d_fullres
+plans: nnUNetPlans
+folds: [0, 1, 2, 3, 4]
+trainer: nnUNetTrainer_100epochs
+epochs_per_fold: 100
+save_probabilities: true
+allow_resume: true
+ensemble: false
+pretrained_weights: null
+external_data: false
+notes: >-
+  This is an official upstream 100-epoch training-length variant used as a
+  compute-limited five-fold experiment. It is not the standard 1000-epoch
+  nnU-Net reference baseline. Validation probabilities are retained for later
+  model and region-wise ensemble research.

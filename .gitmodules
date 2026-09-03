@@ -4,3 +4,12 @@
 [submodule "External/BraTS-2023-Metrics"]
 	path = External/BraTS-2023-Metrics
 	url = https://github.com/rachitsaluja/BraTS-2023-Metrics.git
+[submodule "External/MedNeXt"]
+	path = External/MedNeXt
+	url = https://github.com/MIC-DKFZ/MedNeXt.git
+[submodule "External/MONAI"]
+	path = External/MONAI
+	url = https://github.com/Project-MONAI/MONAI.git
+[submodule "External/MONAI-model-zoo"]
+	path = External/MONAI-model-zoo
+	url = https://github.com/Project-MONAI/model-zoo.git

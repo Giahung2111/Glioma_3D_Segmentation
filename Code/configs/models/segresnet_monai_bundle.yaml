@@ -1,0 +1,67 @@
+backend: segresnet
+model_id: monai_model_zoo_brats_seg_resnet
+upstream:
+  implementation: MONAI
+  repository: https://github.com/Project-MONAI/MONAI.git
+  commit: 46a5272196a6c2590ca2589029eed8e4d56ff008
+  version: 1.4.0
+  recipe_repository: https://github.com/Project-MONAI/model-zoo.git
+  recipe_commit: b9e4d04bb2a073110bde9e5c05c9690241e938b6
+  bundle: brats_mri_segmentation
+  bundle_version: 0.5.4
+classification: single_core_segresnet_compute_limited_comparison
+architecture:
+  class: monai.networks.nets.SegResNet
+  in_channels: 4
+  out_channels: 3
+  init_filters: 16
+  blocks_down: [1, 2, 2, 4]
+  blocks_up: [1, 1, 1]
+  dropout_prob: 0.2
+input:
+  native_channel_order: [T1c, T1n, T2w, T2F]
+  project_suffix_order: ['0001', '0000', '0002', '0003']
+output:
+  native_channel_order: [TC, WT, ET]
+  canonical_channel_order: [ET, TC, WT]
+  conversion: canonical = native[[2, 0, 1]]
+training:
+  original_recipe_epochs: 300
+  epochs_per_fold: 100
+  batch_size: 1
+  crop_size: [224, 224, 144]
+  amp: true
+  optimizer: Adam
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  scheduler: CosineAnnealingLR
+  loss: DiceLoss
+  loss_smooth_nr: 0.0
+  loss_smooth_dr: 0.00001
+  squared_pred: true
+  sigmoid: true
+  validation_interval_epochs: 1
+  seed: 12345
+  num_workers: 4
+augmentation:
+  normalize_nonzero: true
+  normalize_channel_wise: true
+  flip_probability_per_axis: 0.5
+  intensity_scale_factor: 0.1
+  intensity_scale_probability: 1.0
+  intensity_shift_offset: 0.1
+  intensity_shift_probability: 1.0
+inference:
+  roi_size: [240, 240, 160]
+  sliding_window_batch_size: 1
+  overlap: 0.5
+  threshold: 0.5
+notes: >-
+  Exact single-model MONAI Model Zoo BraTS bundle recipe, except the requested
+  100-epoch compute limit and the explicit BraTS 2023 ET-label adapter (3 to
+  the bundle's legacy BraTS label 4 before its official region transform).
+  PyTorch 2.5.1+cu121 is the documented Windows compatibility deviation from
+  the bundle metadata's PyTorch 2.4.0 because the latter wheel requires an
+  unbundled libomp140.x86_64.dll on this host. This is not Auto3DSeg,
+  SegResNetDS, or an ensemble. Seed 12345 is the project-owned reproducibility
+  seed shared with the canonical split; it is not an architecture parameter.

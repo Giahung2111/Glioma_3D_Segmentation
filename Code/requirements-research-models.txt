@@ -1,0 +1,27 @@
+# Direct, experiment-defining dependency pins for the MedNeXt and SegResNet
+# adapters.  Transitive versions are frozen after a verified installation in
+# requirements-research-models-lock.txt by setup_research_models_env.ps1.
+#
+# The MONAI pins come from the official brats_mri_segmentation bundle 0.5.4.
+numpy==1.24.4
+nibabel==5.2.1
+monai==1.4.0
+pytorch-ignite==0.4.11
+scikit-learn==1.5.1
+tensorboard==2.17.0
+
+# MedNeXt v1 declares lower bounds only.  These versions are project-owned
+# compatibility pins and must pass the import/CLI/forward-backward smoke gate.
+batchgenerators==0.25.1
+dicom2nifti==2.4.11
+medpy==0.5.2
+scikit-image==0.24.0
+SimpleITK==2.3.1
+pandas==2.2.2
+requests==2.32.3
+tifffile==2024.7.24
+tqdm==4.66.4
+matplotlib==3.8.4
+scipy==1.11.4
+psutil==6.0.0
+PyYAML==6.0.2

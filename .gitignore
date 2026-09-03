@@ -14,8 +14,10 @@
 # Python environments, caches, coverage, and package build outputs
 # -----------------------------------------------------------------------------
 **/.venv/
+**/.venv-*/
 **/venv/
 **/env/
+**/.codex_tmp/
 **/__pycache__/
 *.py[cod]
 *$py.class
@@ -61,6 +63,7 @@ htmlcov/
 *.7z
 *.tar
 *.tar.gz
+/tmp/
 
 # -----------------------------------------------------------------------------
 # Secrets and machine-local configuration

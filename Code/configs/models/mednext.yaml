@@ -1,5 +1,58 @@
+schema: glioma_mednext_recipe_v1
 backend: mednext
-status: future_placeholder
-enabled: false
-notes: Implement only as a separately versioned future baseline.
+model_id: mednext_v1_s_kernel3
+upstream:
+  repository: https://github.com/MIC-DKFZ/MedNeXt.git
+  commit: 0b78ed869fbd1cc2fd38754d2f8519f1b72d43ba
+  package: mednextv1
+  package_version: 1.7.0
+framework:
+  name: nnU-Net v1 (MedNeXt fork)
+  task_full: Task501_BraTS2023GLI
+  task_smoke: Task951_BraTS2023GLISmoke
+  network: 3d_fullres
+  trainer: nnUNetTrainerV2_MedNeXt_S_kernel3
+  planner_3d: ExperimentPlanner3D_v21_customTargetSpacing_1x1x1
+  plans_identifier: nnUNetPlansv2.1_trgSp_1x1x1
+  data_identifier: nnUNetData_plans_v2.1_trgSp_1x1x1
+architecture:
+  variant: S
+  kernel_size: 3
+  in_channels: 4
+  classes_including_background: 4
+  base_channels: 32
+  expansion_ratio: 2
+  block_counts: [2, 2, 2, 2, 2, 2, 2, 2, 2]
+  deep_supervision: true
+  residual_blocks: true
+  residual_up_down: true
+planning:
+  target_spacing_mm: [1.0, 1.0, 1.0]
+  patch_size: [128, 128, 128]
+training:
+  original_recipe_epochs: 1000
+  requested_epochs: 100
+  classification: compute-limited comparison; architecture, loss, augmentation, optimizer, and poly schedule unchanged
+  optimizer: AdamW
+  initial_learning_rate: 0.001
+  optimizer_epsilon: 0.0001
+  weight_decay: 0.00003
+  lr_schedule: polynomial power 0.9 over requested duration
+  batches_per_epoch: 250
+  validation_batches_per_epoch: 50
+  mixed_precision: true
+  deterministic: false
+  checkpoint_every_completed_epochs: 1
+inference:
+  checkpoint: final
+  sliding_window: true
+  step_size: 0.5
+  gaussian_weighting: true
+  tta: false
+  fold_specific_postprocessing: false
+  retain_native_softmax: true
+probabilities:
+  native_channel_order: [background, NCR, ED, ET]
+  canonical_channel_order: [ET, TC, WT]
+  conversion: ET=p(ET);TC=p(NCR)+p(ET);WT=p(NCR)+p(ED)+p(ET)
 

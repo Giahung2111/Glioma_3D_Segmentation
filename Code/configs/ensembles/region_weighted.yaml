@@ -1,7 +1,10 @@
 enabled: false
 status: future_placeholder
 method: region_weighted_probability
-region_order: [WT, TC, ET]
+# Project ensemble APIs use the scientific/reporting order. Official nnU-Net
+# .npz files are WT,TC,ET and must pass through the explicit safe loader first.
+region_order: [ET, TC, WT]
+nnunet_saved_probability_order: [WT, TC, ET]
 enforce_nested_regions: true
 notes: Weights must be chosen from validation evidence in a future experiment.
 
